@@ -10,9 +10,22 @@ import asyncio
 import logging
 from pathlib import Path
 
+import cv2
+
 from .stream_handler import VideoStreamHandler
 
 logging.basicConfig(level=logging.INFO)
+
+
+def _evidence_path_to_url(file_path: Optional[str]) -> Optional[str]:
+    """Convert filesystem path to frontend-accessible URL (/uploads/...)."""
+    if not file_path:
+        return None
+    path = str(file_path).replace("\\", "/")
+    if "uploads" in path:
+        idx = path.find("uploads")
+        return "/" + path[idx:]
+    return path
 logger = logging.getLogger(__name__)
 
 
@@ -34,13 +47,19 @@ class VideoProcessor:
         self.enable_ai = enable_ai
         if enable_ai:
             try:
-                from ..ai_engine.behavior_detector import BehaviorDetector
-                self.behavior_detector = BehaviorDetector()
-            except ImportError:
-                logger.warning("AI engine module not found. AI detection disabled.")
+                from app.ai_engine.detection_adapter import process_frame, map_detection_to_seat
+                self.process_frame = process_frame
+                self.map_detection_to_seat = map_detection_to_seat
+                self.behavior_detector = True  # Flag that AI is available
+            except ImportError as e:
+                logger.warning("AI engine module not found. AI detection disabled. %s", e)
                 self.enable_ai = False
+                self.process_frame = None
+                self.map_detection_to_seat = None
                 self.behavior_detector = None
         else:
+            self.process_frame = None
+            self.map_detection_to_seat = None
             self.behavior_detector = None
         self.db_session = db_session
         self.processing_results = {}
@@ -158,9 +177,9 @@ class VideoProcessor:
             """Process each frame from live stream"""
             nonlocal frame_count, activities, violations
             
-            # Step 3: AI engine processes frame (DISABLED FOR INPUT TESTING)
-            if self.enable_ai and self.behavior_detector:
-                analysis = self.behavior_detector.process_frame(
+            # Step 3: AI engine processes frame
+            if self.enable_ai and self.process_frame:
+                analysis = self.process_frame(
                     frame, frame_num, timestamp, seat_mapping
                 )
                 student_behaviors = analysis.get('student_behaviors', [])
@@ -175,8 +194,8 @@ class VideoProcessor:
             
             # Step 5: Map to student seats
             for behavior in student_behaviors:
-                if self.enable_ai and self.behavior_detector:
-                    seat_id = self.behavior_detector.map_detection_to_seat(
+                if self.enable_ai and self.map_detection_to_seat:
+                    seat_id = self.map_detection_to_seat(
                         behavior, seat_mapping
                     )
                 else:
@@ -240,8 +259,8 @@ class VideoProcessor:
             "stream_result": stream_result,
             "activities_logged": activities,
             "violations_detected": violations,
-            "total_frames_processed": len(frames_info),
-            "total_frames_in_video": extraction_result.get('total_frames', len(frames_info))
+            "total_frames_processed": frame_count,
+            "total_frames_in_video": frame_count
         }
     
     async def _process_recorded_footage(self, stream_id: str, video_path: str,
@@ -295,13 +314,31 @@ class VideoProcessor:
         total_frames_in_video = extraction_result.get('total_frames', len(frames_info))
         logger.info(f"Extracted {len(frames_info)} frames for analysis (out of {total_frames_in_video} total frames in video)")
         
-        # Step 4: AI engine processes each frame (DISABLED FOR INPUT TESTING)
+        # Build seat mapper for bbox -> student resolution (seating plan coordinates)
+        seat_mapper = None
+        if extraction_result.get('seat_map') and self.db_session:
+            from uuid import UUID
+            from app.video_processing.seat_mapper import SeatMapper
+            from database.models import Room
+
+            room = self.db_session.query(Room).filter(Room.room_id == UUID(room_id)).first()
+            room_no = f"{room.block}-{room.room_number}" if room and room.block else (room.room_number if room else "")
+            seat_mapper = SeatMapper(
+                extraction_result['seat_map'],
+                room_id,
+                exam_id,
+                self.db_session,
+                room_no=room_no,
+            )
+            logger.info("Seat mapper initialized for student identification")
+        
+        # Step 4: AI engine processes each frame
         for idx, frame_info in enumerate(frames_info):
             frame_path = frame_info['frame_path']
             frame_number = frame_info['frame_number']
             timestamp = frame_info['timestamp']
             
-            if self.enable_ai and self.behavior_detector:
+            if self.enable_ai and self.process_frame:
                 # Load frame
                 import cv2
                 frame = cv2.imread(frame_path)
@@ -310,10 +347,16 @@ class VideoProcessor:
                     logger.warning(f"Failed to load frame: {frame_path}")
                     continue
                 
-                # Analyze frame
-                analysis = self.behavior_detector.process_frame(
-                    frame, frame_number, timestamp, seat_mapping
+                # Analyze frame with cheating detection (request annotated for evidence)
+                analysis = self.process_frame(
+                    frame, frame_number, timestamp, return_annotated=True
                 )
+                
+                # Save annotated frame when suspicious activity detected (evidence)
+                if analysis.get("annotated_frame") is not None:
+                    ann_path = str(Path(frame_path).with_suffix("")) + "_detection.jpg"
+                    cv2.imwrite(ann_path, analysis["annotated_frame"])
+                    frame_path = ann_path  # Use annotated frame as evidence
                 
                 frame_analyses.append({
                     "frame_number": frame_number,
@@ -336,13 +379,14 @@ class VideoProcessor:
                 invigilator_behaviors = []
                 logger.info(f"Frame {frame_number} extracted (AI disabled)")
             
-            # Process student behaviors
+            # Process student behaviors - map bbox to student via seating plan
             for behavior in student_behaviors:
                 seat_id = None
-                if self.enable_ai and self.behavior_detector:
-                    seat_id = self.behavior_detector.map_detection_to_seat(
-                        behavior, seat_mapping
-                    )
+                student_id = None
+                if seat_mapper and behavior.get('bbox'):
+                    result = seat_mapper.get_student_for_bbox(behavior['bbox'])
+                    if result:
+                        seat_id, student_id = result
                 
                 activity = {
                     "timestamp": timestamp.isoformat(),
@@ -351,27 +395,31 @@ class VideoProcessor:
                     "severity": behavior['severity'],
                     "confidence": behavior['confidence'],
                     "seat_id": seat_id,
+                    "student_id": student_id,
                     "details": behavior.get('details', ''),
                     "evidence_path": frame_path,
+                    "evidence_url": _evidence_path_to_url(frame_path),
                     "actor_type": "student"
                 }
                 
                 activities.append(activity)
                 
-                # Create violations for high-severity behaviors
-                if behavior['severity'] == 'high' and behavior['confidence'] > 0.8:
-                    violations.append({
-                        "activity": activity,
-                        "violation_type": behavior['behavior_type'],
-                        "severity_level": 3,
-                        "status": "pending",
-                        "evidence_url": frame_path,
-                        "timestamp": timestamp.isoformat()
-                    })
-                
-                # Log to database
+                # Create violations for all suspicious student behaviors (any cheating activity)
+                violations.append({
+                    "activity": activity,
+                    "violation_type": behavior['behavior_type'],
+                    "severity_level": 3 if behavior.get('severity') == 'high' else 2,
+                    "status": "pending",
+                    "evidence_url": _evidence_path_to_url(frame_path) or frame_path,
+                    "timestamp": timestamp.isoformat()
+                })
+
+                # Log to database (StudentActivity + Violation for all detected cheating)
                 if self.db_session:
-                    await self._log_activity_to_db(activity, exam_id, room_id)
+                    await self._log_activity_and_violation(
+                        activity, exam_id, room_id,
+                        create_violation=True,
+                    )
             
             # Process invigilator behaviors
             for behavior in invigilator_behaviors:
@@ -405,19 +453,89 @@ class VideoProcessor:
             "extraction_result": extraction_result
         }
     
-    async def _log_activity_to_db(self, activity: Dict, exam_id: str, room_id: str):
+    def _get_or_create_unidentified_student(self):
+        """Get or create a placeholder student for unmapped detections."""
+        from database.models import Student
+
+        UNIDENTIFIED_EMAIL = "unidentified-ai-detection@foresyte.system"
+        student = self.db_session.query(Student).filter(
+            Student.email == UNIDENTIFIED_EMAIL
+        ).first()
+        if not student:
+            student = Student(
+                name="Unidentified (AI Detection)",
+                email=UNIDENTIFIED_EMAIL,
+                roll_number="UNIDENTIFIED-AI",
+            )
+            self.db_session.add(student)
+            self.db_session.commit()
+            self.db_session.refresh(student)
+            logger.info("Created Unidentified placeholder student for unmapped detections")
+        return str(student.student_id)
+
+    async def _log_activity_and_violation(
+        self, activity: Dict, exam_id: str, room_id: str, create_violation: bool = False
+    ):
         """
-        Step 6 of UC-07: Store activities in database with timestamps.
-        
-        Args:
-            activity: Activity data
-            exam_id: Exam identifier
-            room_id: Room identifier
+        Step 6 of UC-07: Store StudentActivity and optionally Violation in database.
+        Uses student_id from seat mapping when available; otherwise uses Unidentified placeholder.
         """
-        # This would integrate with your database models
-        # Placeholder for actual database logging
-        logger.debug(f"Logging activity to DB: {activity['behavior_type']}")
-        pass
+        if not self.db_session:
+            return
+        student_id = activity.get("student_id")
+        if not student_id:
+            student_id = self._get_or_create_unidentified_student()
+            logger.debug(
+                "No seat mapping for %s - saving as Unidentified",
+                activity.get("behavior_type")
+            )
+        try:
+            from uuid import UUID
+            from database.models import StudentActivity, Violation
+
+            ts = activity.get("timestamp")
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00")) if "T" in ts else datetime.fromisoformat(ts)
+            else:
+                ts = ts or datetime.utcnow()
+
+            evidence_url = _evidence_path_to_url(
+                activity.get("evidence_path") or activity.get("evidence_url")
+            )
+            student_activity = StudentActivity(
+                student_id=UUID(student_id),
+                exam_id=UUID(exam_id),
+                activity_type=activity.get("behavior_type"),
+                severity=activity.get("severity"),
+                confidence=activity.get("confidence"),
+                evidence_url=evidence_url,
+                timestamp=ts,
+            )
+            self.db_session.add(student_activity)
+            self.db_session.commit()
+            self.db_session.refresh(student_activity)
+            logger.info(
+                "Logged activity to DB: %s for student %s",
+                activity["behavior_type"],
+                student_id
+            )
+
+            if create_violation:
+                violation = Violation(
+                    activity_id=student_activity.activity_id,
+                    violation_type=activity.get("behavior_type"),
+                    timestamp=ts,
+                    severity=3,
+                    status="pending",
+                    evidence_url=evidence_url,
+                )
+                self.db_session.add(violation)
+                self.db_session.commit()
+                logger.info("Created violation for %s (student %s)", activity["behavior_type"], student_id)
+        except Exception as e:
+            logger.warning("Failed to log activity/violation to DB: %s", e)
+            if self.db_session:
+                self.db_session.rollback()
     
     async def _log_invigilator_activity_to_db(self, activity: Dict, room_id: str):
         """
