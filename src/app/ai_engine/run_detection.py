@@ -23,7 +23,17 @@ from typing import Optional
 from dotenv import load_dotenv
 
 # Load .env from ai_engine directory
-load_dotenv(Path(__file__).resolve().parent / ".env")
+_AI_ENGINE_DIR = Path(__file__).resolve().parent
+load_dotenv(_AI_ENGINE_DIR / ".env")
+
+
+def _resolve_model_path(path: str) -> str:
+    """Resolve model path: if relative, resolve against ai_engine directory."""
+    p = Path(path)
+    if not p.is_absolute():
+        p = _AI_ENGINE_DIR / path
+    return str(p.resolve())
+
 
 import cv2
 import numpy as np
@@ -51,9 +61,9 @@ class Config:
     output_dir: str = "output"
     output_filename: str = "final_detection.jpg"
 
-    # Models (paths from env, fallback to defaults)
-    person_model_path: str = field(default_factory=lambda: os.getenv("PERSON_MODEL_PATH", "yolov8l.pt"))
-    cheating_model_path: str = field(default_factory=lambda: os.getenv("CHEATING_MODEL_PATH", "besta.pt"))
+    # Models (paths from env, resolved relative to ai_engine dir if not absolute)
+    person_model_path: str = field(default_factory=lambda: _resolve_model_path(os.getenv("PERSON_MODEL_PATH", "yolov8l.pt")))
+    cheating_model_path: str = field(default_factory=lambda: _resolve_model_path(os.getenv("CHEATING_MODEL_PATH", "besta.pt")))
 
     # Detection thresholds
     person_conf: float = 0.40       # Person detector confidence floor
