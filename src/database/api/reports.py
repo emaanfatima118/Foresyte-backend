@@ -26,7 +26,7 @@ except ImportError as e:
     logger.warning("reportlab not installed: %s. PDF generation will create text files. Install with: pip install reportlab", e)
 
 from database.db import get_db, SessionLocal
-from database.models import Report, Violation, Investigator, StudentActivity, Exam
+from database.models import Report, Violation, Investigator, StudentActivity, Exam, Student, InvigilatorActivity, Invigilator, Room
 from database.auth import get_current_user
 
 router = APIRouter(prefix="/reports", tags=["Reports"])
@@ -83,11 +83,22 @@ def generate_csv_report(data: Dict[str, Any], file_path: str) -> bool:
                 }
                 rows.append(row)
         elif 'activities' in data:
-            for activity in data['activities']:
-                violation_info = activity.get('violation', {})
-                row = {
-                    'Activity_ID': activity.get('activity_id', ''),
-                    'Student_Name': activity.get('student_name', ''),
+            if data.get('report_type') == 'invigilator':
+                for activity in data['activities']:
+                    row = {
+                        'Invigilator_Name': activity.get('invigilator_name', ''),
+                        'Room': activity.get('room_name', ''),
+                        'Timestamp': activity.get('timestamp', ''),
+                        'Activity_Type': activity.get('activity_type', ''),
+                        'Notes': activity.get('notes', '') or '',
+                    }
+                    rows.append(row)
+            else:
+                for activity in data['activities']:
+                    violation_info = activity.get('violation', {})
+                    row = {
+                        'Activity_ID': activity.get('activity_id', ''),
+                        'Student_Name': activity.get('student_name', ''),
                     'Roll_Number': activity.get('student_roll_number', ''),
                     'Activity_Type': activity.get('activity_type', ''),
                     'Timestamp': activity.get('timestamp', ''),
@@ -98,15 +109,11 @@ def generate_csv_report(data: Dict[str, Any], file_path: str) -> bool:
                     'Violation_Type': violation_info.get('type', 'N/A') if violation_info else 'N/A',
                     'Violation_Severity': violation_info.get('severity', 'N/A') if violation_info else 'N/A',
                     'Violation_Status': violation_info.get('status', 'N/A') if violation_info else 'N/A',
-                    'Description': activity.get('description', '')
-                }
-                
-                # Add exam info if available
-                if 'exam' in data:
-                    row['Exam_Name'] = data['exam'].get('name', '')
-                    row['Exam_Date'] = data['exam'].get('date', '')
-                
-                rows.append(row)
+                    'Description': activity.get('description', ''),
+                    'Exam_Name': activity.get('exam_name', data['exam'].get('name', '') if 'exam' in data else ''),
+                    'Exam_Date': activity.get('exam_date', data['exam'].get('date', '') if 'exam' in data else ''),
+                    }
+                    rows.append(row)
         else:
             # Generic CSV from dict
             rows = [data] if isinstance(data, dict) else data
@@ -252,64 +259,98 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
         
         # Detailed Activities and Violations section
         if 'activities' in data and data['activities']:
-            story.append(Paragraph("Detailed Violation Report", heading_style))
-            story.append(Spacer(1, 0.1*inch))
+            if data.get('report_type') == 'invigilator':
+                story.append(Paragraph("Invigilator Activities", heading_style))
+                story.append(Spacer(1, 0.1*inch))
+                inv_headers = [['Invigilator', 'Room', 'Time', 'Activity Type', 'Notes']]
+                inv_col_widths = [1.2*inch, 1.0*inch, 0.9*inch, 1.0*inch, 1.5*inch]
+                for activity in data['activities'][:100]:
+                    inv_name = (activity.get('invigilator_name') or 'N/A')[:18]
+                    room_name = (activity.get('room_name') or 'N/A')[:14]
+                    ts = activity.get('timestamp', 'N/A')
+                    if len(ts) > 12:
+                        ts = ts[-8:]  # time only
+                    inv_headers.append([
+                        inv_name,
+                        room_name,
+                        ts,
+                        (activity.get('activity_type') or 'N/A')[:14],
+                        (activity.get('notes') or '')[:24] or '-',
+                    ])
+                if len(data['activities']) > 100:
+                    inv_headers.append(['...', f'{len(data["activities"]) - 100} more', '', '', ''])
+                inv_table = Table(inv_headers, colWidths=inv_col_widths)
+                inv_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#6e5ae6')),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, -1), 7),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7fafc')]),
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ]))
+                story.append(inv_table)
+                story.append(Spacer(1, 0.3*inch))
+            else:
+                story.append(Paragraph("Detailed Violation Report", heading_style))
+                story.append(Spacer(1, 0.1*inch))
             
-            # Create detailed table with violations
-            activities_data = [[
-                'Student',
-                'Roll No',
-                'Activity Type',
-                'Time',
-                'Severity',
-                'Violation Type',
-                'Status'
-            ]]
+                # Create detailed table with violations (include Exam for student reports)
+                has_per_activity_exam = any(a.get('exam_name') for a in data['activities'][:1])
+                if has_per_activity_exam:
+                    activities_data = [[
+                        'Student', 'Roll No', 'Exam', 'Activity Type', 'Time', 'Severity', 'Violation Type', 'Status'
+                    ]]
+                    col_widths = [1.0*inch, 0.6*inch, 1.0*inch, 1.0*inch, 0.5*inch, 0.5*inch, 0.9*inch, 0.6*inch]
+                else:
+                    activities_data = [[
+                        'Student', 'Roll No', 'Activity Type', 'Time', 'Severity', 'Violation Type', 'Status'
+                    ]]
+                    col_widths = [1.2*inch, 0.8*inch, 1.3*inch, 0.7*inch, 0.6*inch, 1.1*inch, 0.8*inch]
             
-            for activity in data['activities'][:100]:  # Show up to 100 activities
-                violation_info = activity.get('violation', {})
-                
-                # Determine row color based on severity
-                student_name = activity.get('student_name', 'Unknown')
-                if len(student_name) > 20:
-                    student_name = student_name[:17] + '...'
-                
-                activities_data.append([
-                    student_name,
-                    activity.get('student_roll_number', 'N/A'),
-                    activity.get('activity_type', 'N/A'),
-                    activity.get('timestamp', 'N/A')[-8:] if activity.get('timestamp') else 'N/A',  # Time only
-                    str(activity.get('severity', 'N/A')),
-                    violation_info.get('type', 'N/A') if violation_info else 'N/A',
-                    violation_info.get('status', 'N/A') if violation_info else 'N/A'
-                ])
+                for activity in data['activities'][:100]:  # Show up to 100 activities
+                    violation_info = activity.get('violation', {})
+                    student_name = activity.get('student_name', 'Unknown')
+                    if len(student_name) > 20:
+                        student_name = student_name[:17] + '...'
+                    exam_display = (activity.get('exam_name') or '') + (' ' + (activity.get('exam_date') or '') if activity.get('exam_date') else '')
+                    if len(exam_display) > 14:
+                        exam_display = exam_display[:11] + '...'
+                    row = [
+                        student_name,
+                        activity.get('student_roll_number', 'N/A'),
+                        activity.get('activity_type', 'N/A'),
+                        activity.get('timestamp', 'N/A')[-8:] if activity.get('timestamp') else 'N/A',
+                        str(activity.get('severity', 'N/A')),
+                        violation_info.get('type', 'N/A') if violation_info else 'N/A',
+                        violation_info.get('status', 'N/A') if violation_info else 'N/A'
+                    ]
+                    if has_per_activity_exam:
+                        row.insert(2, exam_display or 'N/A')
+                    activities_data.append(row)
             
-            if len(data['activities']) > 100:
-                activities_data.append([
-                    '...', 
-                    f'{len(data["activities"]) - 100} more',
-                    '', '', '', '', ''
-                ])
+                if len(data['activities']) > 100:
+                    pad = ['...', f'{len(data["activities"]) - 100} more'] + ([''] * (len(activities_data[0]) - 2))
+                    activities_data.append(pad[:len(activities_data[0])])
             
-            activities_table = Table(
-                activities_data,
-                colWidths=[1.2*inch, 0.8*inch, 1.3*inch, 0.7*inch, 0.6*inch, 1.1*inch, 0.8*inch]
-            )
-            activities_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#6e5ae6')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 7),
-                ('FONTSIZE', (0, 1), (-1, -1), 6),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-                ('TOPPADDING', (0, 0), (-1, -1), 4),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7fafc')]),
-                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ]))
-            story.append(activities_table)
-            story.append(Spacer(1, 0.3*inch))
+                activities_table = Table(activities_data, colWidths=col_widths)
+                activities_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#6e5ae6')),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 7),
+                    ('FONTSIZE', (0, 1), (-1, -1), 6),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7fafc')]),
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ]))
+                story.append(activities_table)
+                story.append(Spacer(1, 0.3*inch))
         
         # Violation section
         if 'violation' in data and data['violation']:
@@ -373,6 +414,7 @@ async def generate_report_file_async(
     try:
         from database.models import Student, Violation as ViolationModel
         
+        # Exam is already imported at module level for per-activity exam info
         # Prepare comprehensive report data
         report_data = {
             'title': f"{report_type.title()} Report",
@@ -402,6 +444,11 @@ async def generate_report_file_async(
                     ViolationModel.activity_id == act.activity_id
                 ).first()
                 
+                # Per-activity exam info (for student report: violations across different exams)
+                exam_for_act = db.query(Exam).filter(Exam.exam_id == act.exam_id).first() if act.exam_id else None
+                activity_detail_exam_name = (exam_for_act.course or "N/A") if exam_for_act else "N/A"
+                activity_detail_exam_date = (exam_for_act.exam_date.strftime("%Y-%m-%d") if exam_for_act and exam_for_act.exam_date else "N/A")
+                
                 # Determine severity category
                 if act.severity:
                     if act.severity in ['low', 'medium', 'high', 'critical']:
@@ -423,6 +470,8 @@ async def generate_report_file_async(
                     'student_id': str(act.student_id) if act.student_id else '',
                     'student_name': student_name,
                     'student_roll_number': student_roll,
+                    'exam_name': activity_detail_exam_name,
+                    'exam_date': activity_detail_exam_date,
                     'severity': str(act.severity) if act.severity else 'N/A',
                     'confidence': f"{act.confidence * 100:.1f}%" if act.confidence else 'N/A',
                     'evidence_url': act.evidence_url or 'N/A',
@@ -548,6 +597,77 @@ async def generate_report_file_async(
         db.close()
         logger.info("generate_report_file_async: done report_id=%s", report_id)
 
+
+async def generate_invigilator_report_file_async(
+    report_id: UUID,
+    file_path: str,
+    format_type: str,
+):
+    """Background task to generate invigilator report file (all invigilator activities)."""
+    logger.info("generate_invigilator_report_file_async: start report_id=%s file_path=%s format=%s", report_id, file_path, format_type)
+    db = SessionLocal()
+    try:
+        activities = (
+            db.query(InvigilatorActivity)
+            .order_by(InvigilatorActivity.timestamp.desc())
+            .all()
+        )
+        detailed = []
+        for act in activities:
+            inv = db.query(Invigilator).filter(Invigilator.invigilator_id == act.invigilator_id).first()
+            room = db.query(Room).filter(Room.room_id == act.room_id).first()
+            room_display = room.room_number if room else "N/A"
+            detailed.append({
+                'activity_id': str(act.activity_id),
+                'invigilator_name': inv.name if inv else 'N/A',
+                'room_name': room_display,
+                'timestamp': act.timestamp.strftime('%Y-%m-%d %H:%M:%S') if act.timestamp else '',
+                'activity_type': act.activity_type or 'N/A',
+                'notes': act.notes or '',
+            })
+        report_data = {
+            'title': 'Invigilator Report',
+            'generated_at': datetime.utcnow().isoformat(),
+            'report_type': 'invigilator',
+            'activities': detailed,
+            'summary': {'total_activities': len(detailed)},
+        }
+        success = False
+        if format_type.lower() == 'json':
+            success = generate_json_report(report_data, file_path)
+        elif format_type.lower() == 'csv':
+            success = generate_csv_report(report_data, file_path)
+        elif format_type.lower() == 'pdf':
+            success = generate_pdf_report(report_data, file_path)
+        else:
+            success = generate_json_report(report_data, file_path)
+        report = db.query(Report).filter(Report.report_id == report_id).first()
+        if report:
+            if success:
+                report.status = "completed"
+                base_name = Path(file_path).stem
+                for ext in ['.pdf', '.txt', '.csv', '.json']:
+                    test_file = REPORTS_DIR / f"{base_name}{ext}"
+                    if test_file.exists():
+                        report.file_path = f"/reports/{test_file.name}"
+                        break
+            else:
+                report.status = "failed"
+            db.commit()
+    except Exception as e:
+        logger.exception("generate_invigilator_report_file_async failed: report_id=%s error=%s", report_id, e)
+        try:
+            r = db.query(Report).filter(Report.report_id == report_id).first()
+            if r:
+                r.status = "failed"
+                db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+        logger.info("generate_invigilator_report_file_async: done report_id=%s", report_id)
+
+
 # -------------------------
 # Helper Functions
 # -------------------------
@@ -654,6 +774,16 @@ class IncidentReportRequest(BaseModel):
 class ExamReportRequest(BaseModel):
     format: str  # pdf, csv, json
     include_statistics: bool
+
+
+class StudentReportRequest(BaseModel):
+    format: str  # pdf, csv, json
+    include_statistics: Optional[bool] = True
+
+
+class InvigilatorReportRequest(BaseModel):
+    format: str  # pdf, csv, json
+    include_statistics: Optional[bool] = True
 
 
 class ReportListResponse(BaseModel):
@@ -879,6 +1009,140 @@ def generate_exam_report(
         format_type=request.format,
         activities=activities,
         exam=exam,
+        violation=violation
+    )
+
+    return {
+        "id": str(new_report.report_id),
+        "file_path": file_path,
+        "format": request.format,
+        "status": "generating"
+    }
+
+
+# -------------------------
+# Generate Invigilator Report
+# -------------------------
+@router.post("/invigilators", status_code=status.HTTP_201_CREATED)
+def generate_invigilator_report(
+    request: InvigilatorReportRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Generate a report of all invigilator activities."""
+    logger.info("generate_invigilator_report: format=%s", request.format)
+    if current_user.get("user_type") not in ["admin", "investigator"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"invigilator_report_{timestamp}.{request.format}"
+    file_path = os.path.join("reports", filename)
+    investigator_id = get_investigator_id_for_report(current_user, db)
+    initial_name = f"Invigilator Report - {datetime.utcnow().strftime('%Y-%m-%d')}"
+    new_report = Report(
+        name=initial_name,
+        report_type="invigilator",
+        file_path=file_path,
+        violation_id=None,
+        generated_by=investigator_id,
+        status="generating"
+    )
+    db.add(new_report)
+    db.commit()
+    db.refresh(new_report)
+    background_tasks.add_task(
+        generate_invigilator_report_file_async,
+        report_id=new_report.report_id,
+        file_path=file_path,
+        format_type=request.format,
+    )
+    return {
+        "id": str(new_report.report_id),
+        "file_path": file_path,
+        "format": request.format,
+        "status": "generating"
+    }
+
+
+# -------------------------
+# Generate Student Violations Report (one student, all exams)
+# -------------------------
+@router.post("/students/{student_id}")
+def generate_student_report(
+    student_id: UUID,
+    request: StudentReportRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Generate a report for a single student showing their violations across all exams.
+    """
+    logger.info("generate_student_report: student_id=%s format=%s", student_id, request.format)
+    if current_user.get("user_type") not in ["admin", "investigator"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    student = db.query(Student).filter(Student.student_id == student_id).first()
+    if not student:
+        logger.warning("generate_student_report: student not found student_id=%s", student_id)
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    # All activities (violations/incidents) for this student, any exam, newest first
+    activities = (
+        db.query(StudentActivity)
+        .filter(StudentActivity.student_id == student_id)
+        .order_by(StudentActivity.timestamp.desc())
+        .all()
+    )
+    logger.info("generate_student_report: student_id=%s activities_count=%s", student_id, len(activities))
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"student_report_{student_id}_{timestamp}.{request.format}"
+    file_path = os.path.join("reports", filename)
+
+    violation = None
+    if activities:
+        violation = db.query(Violation).filter(
+            Violation.activity_id == activities[0].activity_id
+        ).first()
+    if not violation and activities:
+        violation = Violation(
+            activity_id=activities[0].activity_id,
+            violation_type="Student Report",
+            severity=1,
+            status="pending"
+        )
+        db.add(violation)
+        db.commit()
+        db.refresh(violation)
+
+    investigator_id = get_investigator_id_for_report(current_user, db)
+    initial_name = f"Student Report - {student.name or 'Student'} ({student.roll_number or student_id}) - Violations across exams"
+    new_report = Report(
+        name=initial_name,
+        report_type="student",
+        file_path=file_path,
+        violation_id=violation.violation_id if violation else None,
+        generated_by=investigator_id,
+        status="generating"
+    )
+    db.add(new_report)
+    db.commit()
+    db.refresh(new_report)
+
+    logger.info(
+        "generate_student_report: adding background task report_id=%s student_id=%s format=%s",
+        new_report.report_id, student_id, request.format,
+    )
+    background_tasks.add_task(
+        generate_report_file_async,
+        report_id=new_report.report_id,
+        report_type="student",
+        file_path=file_path,
+        format_type=request.format,
+        activities=activities,
+        exam=None,
         violation=violation
     )
 
