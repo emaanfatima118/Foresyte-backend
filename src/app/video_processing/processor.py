@@ -5,6 +5,7 @@ Coordinates video processing, AI detection, and database logging
 
 from datetime import datetime
 from typing import Dict, Any, Optional, List
+from collections import defaultdict
 import json
 import asyncio
 import logging
@@ -13,6 +14,12 @@ from pathlib import Path
 import cv2
 
 from .stream_handler import VideoStreamHandler
+from database.severity_logic import (
+    get_runs_from_detections,
+    filter_qualifying_runs,
+    compute_severity_from_count,
+    severity_to_int,
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -168,16 +175,16 @@ class VideoProcessor:
             Processing results
         """
         logger.info(f"Processing live stream: {stream_url}")
-        
+
         activities = []
         violations = []
         frame_count = 0
-        
+        detections_by_student_live: Dict[str, List[Dict]] = defaultdict(list)
+
         async def frame_callback(frame, frame_num, timestamp):
-            """Process each frame from live stream"""
-            nonlocal frame_count, activities, violations
-            
-            # Step 3: AI engine processes frame
+            """Process each frame: collect detections per student for run-based logic."""
+            nonlocal frame_count
+
             if self.enable_ai and self.process_frame:
                 analysis = self.process_frame(
                     frame, frame_num, timestamp, seat_mapping
@@ -185,51 +192,27 @@ class VideoProcessor:
                 student_behaviors = analysis.get('student_behaviors', [])
                 invigilator_behaviors = analysis.get('invigilator_behaviors', [])
             else:
-                # Skip AI detection - just log frame
                 logger.info(f"Frame {frame_num} captured (AI detection disabled)")
                 student_behaviors = []
                 invigilator_behaviors = []
-            
-            # Step 4: Identify and log suspicious behaviors
-            
-            # Step 5: Map to student seats
+
             for behavior in student_behaviors:
-                if self.enable_ai and self.map_detection_to_seat:
-                    seat_id = self.map_detection_to_seat(
-                        behavior, seat_mapping
-                    )
-                else:
-                    seat_id = None
-                
-                activity = {
+                seat_id = self.map_detection_to_seat(behavior, seat_mapping) if (self.enable_ai and self.map_detection_to_seat) else None
+                student_id = (behavior.get('student_id') or (seat_id if isinstance(seat_id, str) else None))
+                detection = {
                     "timestamp": timestamp.isoformat(),
                     "frame_number": frame_num,
                     "behavior_type": behavior['behavior_type'],
                     "severity": behavior['severity'],
                     "confidence": behavior['confidence'],
                     "seat_id": seat_id,
+                    "student_id": str(student_id) if student_id else None,
                     "details": behavior.get('details', ''),
-                    "actor_type": "student"
+                    "actor_type": "student",
                 }
-                
-                # Step 6: Log activities with timestamps
-                activities.append(activity)
-                
-                # If high severity, create violation
-                if behavior['severity'] == 'high' and behavior['confidence'] > 0.8:
-                    violations.append({
-                        "activity": activity,
-                        "violation_type": behavior['behavior_type'],
-                        "severity_level": 3,
-                        "status": "pending",
-                        "timestamp": timestamp.isoformat()
-                    })
-                
-                # Store in database if session available
-                if self.db_session:
-                    await self._log_activity_to_db(activity, exam_id, room_id)
-            
-            # Log invigilator behaviors
+                key = str(student_id) if student_id else "unidentified"
+                detections_by_student_live[key].append(detection)
+
             for behavior in invigilator_behaviors:
                 activity = {
                     "timestamp": timestamp.isoformat(),
@@ -238,23 +221,52 @@ class VideoProcessor:
                     "severity": behavior['severity'],
                     "confidence": behavior['confidence'],
                     "details": behavior.get('details', ''),
-                    "actor_type": "invigilator"
+                    "actor_type": "invigilator",
                 }
                 activities.append(activity)
-                
                 if self.db_session:
                     await self._log_invigilator_activity_to_db(activity, room_id)
-            
+
             frame_count += 1
-            
             if frame_count % 100 == 0:
-                logger.info(f"Processed {frame_count} frames, {len(activities)} activities")
-        
-        # Process live stream
+                logger.info(f"Processed {frame_count} frames")
+
         stream_result = await self.stream_handler.process_live_stream(
             stream_url, duration_seconds=3600, callback=frame_callback
         )
-        
+
+        # Run-based logic: one activity + one violation per qualifying run per student
+        for student_key, det_list in detections_by_student_live.items():
+            runs = get_runs_from_detections(det_list)
+            qualifying = filter_qualifying_runs(runs)
+            for run in qualifying:
+                fd = run.first_detection
+                severity_str = compute_severity_from_count(run.frame_count, run.label_raw)
+                activity = {
+                    "timestamp": fd.get("timestamp"),
+                    "frame_number": fd.get("frame_number"),
+                    "behavior_type": run.label_raw,
+                    "severity": severity_str,
+                    "confidence": fd.get("confidence"),
+                    "seat_id": fd.get("seat_id"),
+                    "student_id": fd.get("student_id") if student_key != "unidentified" else None,
+                    "details": fd.get("details", "") or f"({run.frame_count} consecutive frames)",
+                    "actor_type": "student",
+                }
+                activities.append(activity)
+                violations.append({
+                    "activity": activity,
+                    "violation_type": run.label_raw,
+                    "severity_level": severity_to_int(severity_str),
+                    "status": "pending",
+                    "timestamp": fd.get("timestamp"),
+                })
+                if self.db_session:
+                    await self._log_activity_and_violation(
+                        activity, exam_id, room_id,
+                        create_violation=True,
+                    )
+
         return {
             "stream_result": stream_result,
             "activities_logged": activities,
@@ -281,7 +293,9 @@ class VideoProcessor:
             Processing results
         """
         logger.info(f"Processing recorded video: {video_path}")
-        
+
+        # Collect detections per student (frame sequence) for run-based violation logic
+        detections_by_student: Dict[str, List[Dict]] = defaultdict(list)
         activities = []
         violations = []
         frame_analyses = []
@@ -379,7 +393,7 @@ class VideoProcessor:
                 invigilator_behaviors = []
                 logger.info(f"Frame {frame_number} extracted (AI disabled)")
             
-            # Process student behaviors - map bbox to student via seating plan
+            # Process student behaviors: collect per student for frame-run logic (one violation per run)
             for behavior in student_behaviors:
                 seat_id = None
                 student_id = None
@@ -387,39 +401,22 @@ class VideoProcessor:
                     result = seat_mapper.get_student_for_bbox(behavior['bbox'])
                     if result:
                         seat_id, student_id = result
-                
-                activity = {
+
+                detection = {
                     "timestamp": timestamp.isoformat(),
                     "frame_number": frame_number,
                     "behavior_type": behavior['behavior_type'],
                     "severity": behavior['severity'],
                     "confidence": behavior['confidence'],
                     "seat_id": seat_id,
-                    "student_id": student_id,
+                    "student_id": str(student_id) if student_id else None,
                     "details": behavior.get('details', ''),
                     "evidence_path": frame_path,
                     "evidence_url": _evidence_path_to_url(frame_path),
-                    "actor_type": "student"
+                    "actor_type": "student",
                 }
-                
-                activities.append(activity)
-                
-                # Create violations for all suspicious student behaviors (any cheating activity)
-                violations.append({
-                    "activity": activity,
-                    "violation_type": behavior['behavior_type'],
-                    "severity_level": 3 if behavior.get('severity') == 'high' else 2,
-                    "status": "pending",
-                    "evidence_url": _evidence_path_to_url(frame_path) or frame_path,
-                    "timestamp": timestamp.isoformat()
-                })
-
-                # Log to database (StudentActivity + Violation for all detected cheating)
-                if self.db_session:
-                    await self._log_activity_and_violation(
-                        activity, exam_id, room_id,
-                        create_violation=True,
-                    )
+                key = str(student_id) if student_id else "unidentified"
+                detections_by_student[key].append(detection)
             
             # Process invigilator behaviors
             for behavior in invigilator_behaviors:
@@ -441,7 +438,42 @@ class VideoProcessor:
             # Progress logging
             if (idx + 1) % 10 == 0:
                 logger.info(f"Analyzed {idx + 1}/{len(frames_info)} frames")
-        
+
+        # Run-based logic: one activity + one violation per qualifying run per student (no redundant per-frame)
+        for student_key, det_list in detections_by_student.items():
+            runs = get_runs_from_detections(det_list)
+            qualifying = filter_qualifying_runs(runs)
+            for run in qualifying:
+                fd = run.first_detection
+                severity_str = compute_severity_from_count(run.frame_count, run.label_raw)
+                activity = {
+                    "timestamp": fd.get("timestamp"),
+                    "frame_number": fd.get("frame_number"),
+                    "behavior_type": run.label_raw,
+                    "severity": severity_str,
+                    "confidence": fd.get("confidence"),
+                    "seat_id": fd.get("seat_id"),
+                    "student_id": fd.get("student_id") if student_key != "unidentified" else None,
+                    "details": fd.get("details", "") or f"({run.frame_count} consecutive frames)",
+                    "evidence_path": fd.get("evidence_path"),
+                    "evidence_url": fd.get("evidence_url"),
+                    "actor_type": "student",
+                }
+                activities.append(activity)
+                violations.append({
+                    "activity": activity,
+                    "violation_type": run.label_raw,
+                    "severity_level": severity_to_int(severity_str),
+                    "status": "pending",
+                    "evidence_url": fd.get("evidence_url") or fd.get("evidence_path"),
+                    "timestamp": fd.get("timestamp"),
+                })
+                if self.db_session:
+                    await self._log_activity_and_violation(
+                        activity, exam_id, room_id,
+                        create_violation=True,
+                    )
+
         return {
             "success": True,
             "activities_logged": activities,

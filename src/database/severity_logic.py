@@ -3,11 +3,15 @@ Severity logic: frequency-based severity levels per activity type.
 
 Severity increases with how often the same action is done (per student, per exam).
 Each activity type has its own thresholds: different actions escalate at different rates.
+
+Frame-run logic: track consecutive same-label frames per student. One violation per run;
+sustained labels (e.g. look around) require min consecutive frames; instant labels (e.g. phone) count from 1 frame.
 """
 
 from typing import Dict, List, Tuple, Optional, Any
 from uuid import UUID
 from datetime import datetime, timedelta
+from dataclasses import dataclass
 
 # Severity levels (string for StudentActivity, int 1-4 for Violation)
 SEVERITY_LEVELS = ("low", "medium", "high", "critical")
@@ -80,6 +84,87 @@ ACTIVITY_SEVERITY_CONFIG: Dict[str, List[Tuple[int, str]]] = {
     "unknown": [(1, "low"), (4, "medium"), (8, "high"), (12, "critical")],
     "normal": [(1, "low")],
 }
+
+# Frame-run logic: min consecutive frames for a run to count as a violation (1 = instant; 2+ = sustained).
+# Severity for qualifying runs is then based on run length (frequency) via ACTIVITY_SEVERITY_CONFIG.
+MIN_FRAMES_TO_COUNT: Dict[str, int] = {
+    "cheating_attempt": 1,
+    "phone_device": 1,
+    "multiple_faces": 1,
+    "unauthorized_materials": 1,
+    "hand_under_table": 3,     # violation from 3rd frame
+    "stand_up": 1,             # violation on first frame captured
+    "looking_around": 5,       # violation from 5th frame (ignore brief glances)
+    "bend_over_desk": 3,
+    "wave": 3,
+    "talking_communication": 2,
+    "suspicious_movement": 2,
+    "audio_detected": 2,
+    "unknown": 1,
+    "normal": 999,             # never count normal as violation
+}
+
+
+@dataclass
+class LabelRun:
+    """One contiguous run of the same label for a student (frame sequence)."""
+    start_ts: Any
+    end_ts: Any
+    label_raw: str
+    normalized_key: str
+    frame_count: int
+    first_detection: Dict[str, Any]
+
+
+def get_runs_from_detections(detections: List[Dict[str, Any]]) -> List[LabelRun]:
+    """
+    Group detections into consecutive same-label runs (by timestamp).
+    When the label changes (including to/from 'normal'), a new run starts.
+    Detections must be sorted by timestamp; we sort if not.
+    """
+    if not detections:
+        return []
+    sorted_d = sorted(detections, key=lambda x: (x.get("timestamp") or x.get("frame_number", 0)))
+    runs: List[LabelRun] = []
+    current: List[Dict] = []
+    current_key: Optional[str] = None
+
+    for d in sorted_d:
+        raw = (d.get("behavior_type") or d.get("activity_type") or "").strip() or "unknown"
+        key = _normalize_activity_type(raw)
+        if key != current_key:
+            if current and current_key and current_key != "normal":
+                runs.append(LabelRun(
+                    start_ts=current[0].get("timestamp"),
+                    end_ts=current[-1].get("timestamp"),
+                    label_raw=current[0].get("behavior_type") or current[0].get("activity_type") or raw,
+                    normalized_key=current_key,
+                    frame_count=len(current),
+                    first_detection=current[0],
+                ))
+            current = [d]
+            current_key = key
+        else:
+            current.append(d)
+
+    if current and current_key and current_key != "normal":
+        runs.append(LabelRun(
+            start_ts=current[0].get("timestamp"),
+            end_ts=current[-1].get("timestamp"),
+            label_raw=current[0].get("behavior_type") or current[0].get("activity_type") or "unknown",
+            normalized_key=current_key,
+            frame_count=len(current),
+            first_detection=current[0],
+        ))
+    return runs
+
+
+def filter_qualifying_runs(runs: List[LabelRun]) -> List[LabelRun]:
+    """Keep only runs that meet the min consecutive frames for that label (one violation per run, no redundant)."""
+    return [
+        r for r in runs
+        if r.frame_count >= MIN_FRAMES_TO_COUNT.get(r.normalized_key, 1)
+    ]
 
 
 def compute_severity_from_count(count: int, activity_type: str) -> str:
