@@ -352,11 +352,21 @@ class VideoProcessor:
                     frame, frame_number, timestamp, return_annotated=True
                 )
                 
+                # Default: use local path as evidence URL
+                evidence_url_preferred = _evidence_path_to_url(frame_path)
                 # Save annotated frame when suspicious activity detected (evidence)
                 if analysis.get("annotated_frame") is not None:
                     ann_path = str(Path(frame_path).with_suffix("")) + "_detection.jpg"
                     cv2.imwrite(ann_path, analysis["annotated_frame"])
                     frame_path = ann_path  # Use annotated frame as evidence
+                    # Upload to Backblaze B2 when configured (preserves evidence in cloud)
+                    try:
+                        from app.storage.b2_storage import upload_evidence_frame
+                        b2_url = upload_evidence_frame(ann_path)
+                        evidence_url_preferred = b2_url if b2_url else _evidence_path_to_url(ann_path)
+                    except Exception as e:
+                        logger.debug("B2 upload skipped or failed: %s", e)
+                        evidence_url_preferred = _evidence_path_to_url(ann_path)
                 
                 frame_analyses.append({
                     "frame_number": frame_number,
@@ -398,7 +408,7 @@ class VideoProcessor:
                     "student_id": student_id,
                     "details": behavior.get('details', ''),
                     "evidence_path": frame_path,
-                    "evidence_url": _evidence_path_to_url(frame_path),
+                    "evidence_url": evidence_url_preferred,
                     "actor_type": "student"
                 }
                 
@@ -410,7 +420,7 @@ class VideoProcessor:
                     "violation_type": behavior['behavior_type'],
                     "severity_level": 3 if behavior.get('severity') == 'high' else 2,
                     "status": "pending",
-                    "evidence_url": _evidence_path_to_url(frame_path) or frame_path,
+                    "evidence_url": evidence_url_preferred or frame_path,
                     "timestamp": timestamp.isoformat()
                 })
 
@@ -499,9 +509,11 @@ class VideoProcessor:
             else:
                 ts = ts or datetime.utcnow()
 
-            evidence_url = _evidence_path_to_url(
-                activity.get("evidence_path") or activity.get("evidence_url")
-            )
+            raw = activity.get("evidence_url") or activity.get("evidence_path")
+            if raw and (str(raw).startswith("http://") or str(raw).startswith("https://")):
+                evidence_url = raw  # Already a full URL (e.g. B2)
+            else:
+                evidence_url = _evidence_path_to_url(raw)
             student_activity = StudentActivity(
                 student_id=UUID(student_id),
                 exam_id=UUID(exam_id),

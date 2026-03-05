@@ -297,18 +297,18 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
                 story.append(Paragraph("Detailed Violation Report", heading_style))
                 story.append(Spacer(1, 0.1*inch))
             
-                # Create detailed table with violations (include Exam for student reports)
+                # Create detailed table with violations (include Exam for student reports, Evidence link)
                 has_per_activity_exam = any(a.get('exam_name') for a in data['activities'][:1])
                 if has_per_activity_exam:
                     activities_data = [[
-                        'Student', 'Roll No', 'Exam', 'Activity Type', 'Time', 'Severity', 'Violation Type', 'Status'
+                        'Student', 'Roll No', 'Exam', 'Activity Type', 'Time', 'Severity', 'Violation Type', 'Status', 'Evidence'
                     ]]
-                    col_widths = [1.0*inch, 0.6*inch, 1.0*inch, 1.0*inch, 0.5*inch, 0.5*inch, 0.9*inch, 0.6*inch]
+                    col_widths = [1.0*inch, 0.6*inch, 1.0*inch, 1.0*inch, 0.5*inch, 0.5*inch, 0.9*inch, 0.6*inch, 0.5*inch]
                 else:
                     activities_data = [[
-                        'Student', 'Roll No', 'Activity Type', 'Time', 'Severity', 'Violation Type', 'Status'
+                        'Student', 'Roll No', 'Activity Type', 'Time', 'Severity', 'Violation Type', 'Status', 'Evidence'
                     ]]
-                    col_widths = [1.2*inch, 0.8*inch, 1.3*inch, 0.7*inch, 0.6*inch, 1.1*inch, 0.8*inch]
+                    col_widths = [1.2*inch, 0.8*inch, 1.3*inch, 0.7*inch, 0.6*inch, 1.1*inch, 0.8*inch, 0.5*inch]
             
                 for activity in data['activities'][:100]:  # Show up to 100 activities
                     violation_info = activity.get('violation', {})
@@ -318,6 +318,11 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
                     exam_display = (activity.get('exam_name') or '') + (' ' + (activity.get('exam_date') or '') if activity.get('exam_date') else '')
                     if len(exam_display) > 14:
                         exam_display = exam_display[:11] + '...'
+                    ev_url = activity.get('evidence_url') or 'N/A'
+                    if ev_url and ev_url != 'N/A' and (ev_url.startswith('http://') or ev_url.startswith('https://')):
+                        evidence_cell = Paragraph(f'<a href="{ev_url}" color="#0066cc">View</a>', styles['Normal'])
+                    else:
+                        evidence_cell = ev_url[:8] + '...' if ev_url and len(str(ev_url)) > 8 else (ev_url or '-')
                     row = [
                         student_name,
                         activity.get('student_roll_number', 'N/A'),
@@ -325,15 +330,17 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
                         activity.get('timestamp', 'N/A')[-8:] if activity.get('timestamp') else 'N/A',
                         str(activity.get('severity', 'N/A')),
                         violation_info.get('type', 'N/A') if violation_info else 'N/A',
-                        violation_info.get('status', 'N/A') if violation_info else 'N/A'
+                        violation_info.get('status', 'N/A') if violation_info else 'N/A',
+                        evidence_cell
                     ]
                     if has_per_activity_exam:
                         row.insert(2, exam_display or 'N/A')
                     activities_data.append(row)
             
                 if len(data['activities']) > 100:
-                    pad = ['...', f'{len(data["activities"]) - 100} more'] + ([''] * (len(activities_data[0]) - 2))
-                    activities_data.append(pad[:len(activities_data[0])])
+                    pad_len = len(activities_data[0])
+                    pad = ['...', f'{len(data["activities"]) - 100} more'] + ([''] * (pad_len - 2))
+                    activities_data.append(pad[:pad_len])
             
                 activities_table = Table(activities_data, colWidths=col_widths)
                 activities_table.setStyle(TableStyle([
@@ -352,15 +359,21 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
                 story.append(activities_table)
                 story.append(Spacer(1, 0.3*inch))
         
-        # Violation section
-        if 'violation' in data and data['violation']:
+        # Violation section (primary_violation from report_data)
+        viol_data = data.get('primary_violation') or data.get('violation')
+        if viol_data:
             story.append(Paragraph("Violation Details", heading_style))
-            violation = data['violation']
+            violation = viol_data
+            ev_url = violation.get('evidence_url') or 'N/A'
+            evidence_row = ['Evidence:', ev_url]
+            if ev_url and ev_url != 'N/A' and (str(ev_url).startswith('http://') or str(ev_url).startswith('https://')):
+                evidence_row[1] = Paragraph(f'<a href="{ev_url}" color="#0066cc">View evidence image</a>', styles['Normal'])
             violation_data = [
                 ['Violation ID:', violation.get('id', 'N/A')],
                 ['Type:', violation.get('type', 'N/A')],
                 ['Severity:', str(violation.get('severity', 'N/A'))],
                 ['Status:', violation.get('status', 'N/A')],
+                evidence_row,
             ]
             
             violation_table = Table(violation_data, colWidths=[2*inch, 4*inch])
@@ -413,8 +426,16 @@ async def generate_report_file_async(
     db = SessionLocal()
     try:
         from database.models import Student, Violation as ViolationModel
-        
-        # Exam is already imported at module level for per-activity exam info
+        from app.storage.b2_storage import download_evidence_for_report
+
+        # Collect all evidence URLs and download from B2 to uploads/downloads/evidence
+        evidence_urls = []
+        if activities:
+            evidence_urls.extend(a.evidence_url for a in activities if a.evidence_url and a.evidence_url != "N/A")
+        if violation and violation.evidence_url and violation.evidence_url != "N/A":
+            evidence_urls.append(violation.evidence_url)
+        evidence_url_map = download_evidence_for_report(str(report_id), list(set(evidence_urls)))
+
         # Prepare comprehensive report data
         report_data = {
             'title': f"{report_type.title()} Report",
@@ -463,6 +484,9 @@ async def generate_report_file_async(
                         else:
                             severity_counts['critical'] += 1
                 
+                # Use localhost link from downloads folder when available
+                orig_evidence = act.evidence_url or "N/A"
+                evidence_display = evidence_url_map.get(orig_evidence, orig_evidence) if orig_evidence != "N/A" else "N/A"
                 activity_detail = {
                     'activity_id': str(act.activity_id),
                     'activity_type': act.activity_type or 'Unknown',
@@ -474,7 +498,7 @@ async def generate_report_file_async(
                     'exam_date': activity_detail_exam_date,
                     'severity': str(act.severity) if act.severity else 'N/A',
                     'confidence': f"{act.confidence * 100:.1f}%" if act.confidence else 'N/A',
-                    'evidence_url': act.evidence_url or 'N/A',
+                    'evidence_url': evidence_display,
                     'description': f"{act.activity_type} detected at {act.timestamp.strftime('%H:%M:%S') if act.timestamp else 'unknown time'}"
                 }
                 
@@ -515,13 +539,15 @@ async def generate_report_file_async(
             report_data['summary']['exam_date'] = exam.exam_date.strftime('%Y-%m-%d') if exam.exam_date else 'N/A'
         
         if violation:
+            orig_viol_evidence = violation.evidence_url or "N/A"
+            viol_evidence_display = evidence_url_map.get(orig_viol_evidence, orig_viol_evidence) if orig_viol_evidence != "N/A" else "N/A"
             report_data['primary_violation'] = {
                 'id': str(violation.violation_id),
                 'type': violation.violation_type or 'Unknown',
                 'severity': violation.severity or 0,
                 'status': violation.status or 'pending',
                 'timestamp': violation.timestamp.strftime('%Y-%m-%d %H:%M:%S') if violation.timestamp else '',
-                'evidence_url': violation.evidence_url or 'N/A'
+                'evidence_url': viol_evidence_display
             }
         
         logger.info(
