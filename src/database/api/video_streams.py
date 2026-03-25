@@ -15,7 +15,7 @@ import os
 import logging
 
 from database.db import get_db
-from database.models import VideoStream, ProcessingJob, FrameLog, Exam, Room
+from database.models import VideoStream, ProcessingJob, FrameLog, Exam, Room, ExamInvigilatorAssignment
 from app.video_processing.processor import VideoProcessor
 
 # Setup logging
@@ -194,22 +194,42 @@ async def upload_exam_footage(
     ```
     """
     try:
-        # Read file content
-        file_content = await video_file.read()
-        file_size = len(file_content)
-        
-        # Validate file
-        is_valid, message = validate_video_file(video_file.filename, file_size)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=message)
-        
-        # Validate UUIDs
+        # Validate UUIDs first (before reading a large file)
         try:
             exam_uuid = UUID(exam_id)
             room_uuid = UUID(room_id)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid exam_id or room_id format")
-        
+
+        if USE_DATABASE and db:
+            exam = db.query(Exam).filter(Exam.exam_id == exam_uuid).first()
+            room = db.query(Room).filter(Room.room_id == room_uuid).first()
+            if not exam:
+                raise HTTPException(status_code=404, detail="Exam not found")
+            if not room:
+                raise HTTPException(status_code=404, detail="Room not found")
+            if room.exam_id != exam_uuid:
+                raise HTTPException(status_code=400, detail="Room does not belong to this exam")
+            asn = (
+                db.query(ExamInvigilatorAssignment)
+                .filter(ExamInvigilatorAssignment.room_id == room_uuid)
+                .first()
+            )
+            if not asn:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Assign an invigilator to this exam room in Invigilator Plans before uploading video.",
+                )
+
+        # Read file content
+        file_content = await video_file.read()
+        file_size = len(file_content)
+
+        # Validate file
+        is_valid, message = validate_video_file(video_file.filename, file_size)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=message)
+
         # Generate stream ID
         stream_id = uuid4()
         
@@ -226,15 +246,7 @@ async def upload_exam_footage(
         if USE_DATABASE and db:
             logger.info("Attempting to save video stream to database...")
             try:
-                # Validate exam and room exist
-                exam = db.query(Exam).filter(Exam.exam_id == exam_uuid).first()
-                room = db.query(Room).filter(Room.room_id == room_uuid).first()
-                
-                if not exam:
-                    raise HTTPException(status_code=404, detail=f"Exam not found")
-                if not room:
-                    raise HTTPException(status_code=404, detail=f"Room not found")
-                
+                # Exam, room, and invigilator assignment were validated before upload
                 # Create video stream record
                 video_stream = VideoStream(
                     stream_id=stream_id,

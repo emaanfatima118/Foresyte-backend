@@ -24,6 +24,7 @@ from database.api.incidents import router as incidents_router
 from database.api.monitoring import router as monitoring_router
 from database.api.users import router as users_router
 from database.api.seating_plans import router as seating_plans_router
+from database.api.invigilator_plans import router as invigilator_plans_router
 from database.api.notifications import router as notifications_router
 from database.auth import router as auth_router
 from app.seating_plan.upload_plan import router as upload_plan_router
@@ -144,6 +145,7 @@ app.include_router(incidents_router)
 app.include_router(monitoring_router)
 app.include_router(users_router)
 app.include_router(seating_plans_router)
+app.include_router(invigilator_plans_router)
 app.include_router(notifications_router)
 app.include_router(auth_router)
 app.include_router(upload_plan_router)

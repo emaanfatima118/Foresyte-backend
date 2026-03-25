@@ -225,7 +225,7 @@ class VideoProcessor:
                 }
                 activities.append(activity)
                 if self.db_session:
-                    await self._log_invigilator_activity_to_db(activity, room_id)
+                    await self._log_invigilator_activity_to_db(activity, exam_id, room_id)
 
             frame_count += 1
             if frame_count % 100 == 0:
@@ -443,7 +443,7 @@ class VideoProcessor:
                 activities.append(activity)
                 
                 if self.db_session:
-                    await self._log_invigilator_activity_to_db(activity, room_id)
+                    await self._log_invigilator_activity_to_db(activity, exam_id, room_id)
             
             # Progress logging
             if (idx + 1) % 10 == 0:
@@ -581,16 +581,66 @@ class VideoProcessor:
             if self.db_session:
                 self.db_session.rollback()
     
-    async def _log_invigilator_activity_to_db(self, activity: Dict, room_id: str):
+    async def _log_invigilator_activity_to_db(self, activity: Dict, exam_id: str, room_id: str):
         """
-        Log invigilator activity to database.
-        
-        Args:
-            activity: Activity data
-            room_id: Room identifier
+        Log invigilator activity to database, attributed to the single invigilator
+        assigned to this exam room (invigilator plan).
         """
-        logger.debug(f"Logging invigilator activity to DB: {activity['behavior_type']}")
-        pass
+        if not self.db_session:
+            return
+        from uuid import UUID
+        from database.models import ExamInvigilatorAssignment, InvigilatorActivity, Invigilator
+
+        logger.debug("Logging invigilator activity to DB: %s", activity.get("behavior_type"))
+        try:
+            exam_uuid = UUID(str(exam_id).strip())
+            room_uuid = UUID(str(room_id).strip())
+        except (ValueError, TypeError):
+            logger.warning("Invalid exam_id or room_id for invigilator activity log")
+            return
+
+        row = (
+            self.db_session.query(ExamInvigilatorAssignment)
+            .filter(
+                ExamInvigilatorAssignment.exam_id == exam_uuid,
+                ExamInvigilatorAssignment.room_id == room_uuid,
+            )
+            .first()
+        )
+        if not row:
+            logger.warning(
+                "No invigilator plan for exam %s room %s — assign an invigilator in Invigilator Plans",
+                exam_id,
+                room_id,
+            )
+            return
+
+        invigilator_id = row.invigilator_id
+        ts_raw = activity.get("timestamp")
+        if isinstance(ts_raw, datetime):
+            ts = ts_raw
+        elif isinstance(ts_raw, str):
+            try:
+                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            except ValueError:
+                ts = datetime.utcnow()
+        else:
+            ts = datetime.utcnow()
+
+        rec = InvigilatorActivity(
+            invigilator_id=invigilator_id,
+            room_id=room_uuid,
+            activity_type=str(activity.get("behavior_type", "unknown")),
+            notes=(activity.get("details") or None),
+            timestamp=ts,
+        )
+        self.db_session.add(rec)
+        self.db_session.commit()
+        self.db_session.refresh(rec)
+        inv = self.db_session.query(Invigilator).filter(Invigilator.invigilator_id == invigilator_id).first()
+        if inv:
+            activity["invigilator_name"] = inv.name
+            activity["invigilator_id"] = str(invigilator_id)
     
     def get_processing_results(self, stream_id: str) -> Optional[Dict[str, Any]]:
         """
