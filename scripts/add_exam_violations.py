@@ -42,6 +42,11 @@ from database.models import (
     Exam, Student, StudentActivity, Violation, Seat, Room
 )
 from database.auth import hash_password
+from database.severity_logic import (
+    compute_severity_from_count,
+    count_same_activity_in_exam,
+    severity_to_int,
+)
 
 # Exam details
 EXAM_ID = "b424986c-d41a-4086-af61-014967e718fe"
@@ -72,7 +77,7 @@ VIOLATION_TYPES = [
     "Using Phone"
 ]
 
-# Severity levels
+# Severity levels (for display / violation integer)
 SEVERITY_LEVELS = {
     "low": 1,
     "medium": 2,
@@ -80,18 +85,6 @@ SEVERITY_LEVELS = {
     "critical": 4
 }
 
-def get_severity_for_activity(activity_type: str) -> int:
-    """Determine severity based on activity type."""
-    if "Cheating" in activity_type or "Unauthorized" in activity_type:
-        return SEVERITY_LEVELS["high"]
-    elif "Device" in activity_type or "Phone" in activity_type:
-        return SEVERITY_LEVELS["high"]
-    elif "Communication" in activity_type:
-        return SEVERITY_LEVELS["medium"]
-    elif "Talking" in activity_type:
-        return SEVERITY_LEVELS["medium"]
-    else:
-        return SEVERITY_LEVELS["low"]
 
 def add_exam_violations_and_incidents():
     """Add violations and incidents for the specified exam."""
@@ -153,8 +146,11 @@ def add_exam_violations_and_incidents():
         for i in range(num_incidents):
             student = random.choice(students)
             activity_type = random.choice(ACTIVITY_TYPES)
-            severity_str = random.choice(["low", "medium", "high"])
-            severity = SEVERITY_LEVELS[severity_str]
+            # Frequency-based severity: count same action for this student in this exam
+            count = count_same_activity_in_exam(
+                student.student_id, exam_id_uuid, activity_type, db
+            )
+            severity_str = compute_severity_from_count(count + 1, activity_type)
             
             # Create timestamp during exam time (random time between start and end)
             if exam.start_time and exam.end_time:
@@ -178,7 +174,8 @@ def add_exam_violations_and_incidents():
             )
             
             db.add(activity)
-            activities_created.append((activity, severity))
+            db.flush()  # so next count_same_activity_in_exam includes this row
+            activities_created.append((activity, severity_str))
         
         db.commit()
         print(f"✓ Created {len(activities_created)} student activities")
@@ -187,25 +184,23 @@ def add_exam_violations_and_incidents():
         print(f"\nCreating violations for {len(activities_created)} activities...")
         violations_created = []
         
-        for activity, activity_severity in activities_created:
+        for activity, activity_severity_str in activities_created:
             db.refresh(activity)
+            # Use frequency-based severity from activity (string -> int for Violation)
+            violation_severity = severity_to_int(activity_severity_str)
             
             # Determine violation type based on activity
             if "Cheating" in activity.activity_type or "Unauthorized" in activity.activity_type:
                 violation_type = "Academic Dishonesty"
-                violation_severity = SEVERITY_LEVELS["high"]
                 violation_status = "pending"
             elif "Device" in activity.activity_type or "Phone" in activity.activity_type:
                 violation_type = "Unauthorized Device"
-                violation_severity = SEVERITY_LEVELS["high"]
                 violation_status = "pending"
             elif "Communication" in activity.activity_type or "Talking" in activity.activity_type:
                 violation_type = "Communication"
-                violation_severity = SEVERITY_LEVELS["medium"]
                 violation_status = "pending"
             else:
                 violation_type = random.choice(VIOLATION_TYPES)
-                violation_severity = activity_severity
                 violation_status = random.choice(["pending", "under_review"])
             
             violation = Violation(
@@ -234,15 +229,14 @@ def add_exam_violations_and_incidents():
         print(f"  - {len(activities_created)} Student Activities (Incidents)")
         print(f"  - {len(violations_created)} Violations")
         
-        # Show breakdown by severity
+        # Show breakdown by severity (activity severity is now string)
         severity_breakdown = {}
-        for _, severity in activities_created:
-            severity_name = [k for k, v in SEVERITY_LEVELS.items() if v == severity][0]
-            severity_breakdown[severity_name] = severity_breakdown.get(severity_name, 0) + 1
+        for _, sev_str in activities_created:
+            severity_breakdown[sev_str] = severity_breakdown.get(sev_str, 0) + 1
         
-        print(f"\nSeverity Breakdown:")
-        for severity, count in severity_breakdown.items():
-            print(f"  - {severity.capitalize()}: {count}")
+        print(f"\nSeverity Breakdown (frequency-based):")
+        for sev_name, count in severity_breakdown.items():
+            print(f"  - {sev_name.capitalize()}: {count}")
         
         print("\n✓ All data added successfully!")
         print("\nYou can now generate reports for this exam and they will include these violations.")

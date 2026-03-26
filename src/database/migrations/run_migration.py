@@ -18,16 +18,31 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _sql_statements(sql: str):
+    """Split SQL file on ';' and strip leading full-line -- comments (avoids skipping CREATE after headers)."""
+    for raw in sql.split(";"):
+        lines = []
+        for line in raw.splitlines():
+            s = line.strip()
+            if not s or s.startswith("--"):
+                continue
+            lines.append(line)
+        block = "\n".join(lines).strip()
+        if block:
+            yield block
+
+
 def run_sql_file(conn, filename: str, description: str) -> bool:
     """Run a single SQL migration file."""
     migration_file = Path(__file__).parent / filename
     if not migration_file.exists():
         logger.warning("Migration file not found: %s", migration_file)
         return True  # skip
-    with open(migration_file, "r") as f:
+    with open(migration_file, "r", encoding="utf-8") as f:
         sql = f.read()
     logger.info("Running migration: %s...", description)
-    conn.execute(text(sql))
+    for stmt in _sql_statements(sql):
+        conn.execute(text(stmt))
     return True
 
 
@@ -38,6 +53,10 @@ def run_migration():
             run_sql_file(conn, "add_stream_url_to_rooms.sql", "Add stream_url to rooms")
             run_sql_file(conn, "add_report_name.sql", "Add name to reports")
             run_sql_file(conn, "add_report_status.sql", "Add status to reports")
+            run_sql_file(conn, "add_exam_invigilator_assignments.sql", "Exam invigilator assignments")
+            run_sql_file(conn, "invigilator_one_per_room.sql", "One invigilator per room (dedupe + unique)")
+            run_sql_file(conn, "add_invigilator_activity_severity.sql", "Invigilator activity severity column")
+            run_sql_file(conn, "add_invigilator_activity_category.sql", "Invigilator activity category and duration")
             conn.commit()
             logger.info("[SUCCESS] Migrations completed successfully!")
             return True

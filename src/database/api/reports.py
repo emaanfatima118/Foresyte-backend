@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import ProgrammingError
 from uuid import UUID
 from datetime import datetime, date
 from typing import List, Optional, Dict, Any
@@ -26,7 +27,11 @@ except ImportError as e:
     logger.warning("reportlab not installed: %s. PDF generation will create text files. Install with: pip install reportlab", e)
 
 from database.db import get_db, SessionLocal
+<<<<<<< HEAD
 from database.models import Report, Violation, Investigator, StudentActivity, Exam
+=======
+from database.models import Report, Violation, Investigator, StudentActivity, Exam, Student, InvigilatorActivity, Invigilator, Room, ExamInvigilatorAssignment
+>>>>>>> b003b4f5d912c3823aed770b8cd4e0da7e87090c
 from database.auth import get_current_user
 from database.severity_logic import severity_from_int
 
@@ -55,6 +60,10 @@ def generate_json_report(data: Dict[str, Any], file_path: str) -> bool:
             'activities_and_violations': data.get('activities', []),
             'primary_violation': data.get('primary_violation', None)
         }
+        if data.get('report_type') == 'invigilator':
+            json_data['invigilator_header_lines'] = data.get('invigilator_header_lines', [])
+            json_data['invigilator_violations'] = data.get('invigilator_violations', [])
+            json_data['invigilation_activity'] = data.get('invigilation_activity', [])
         
         with open(full_path, 'w', encoding='utf-8') as f:
             json.dump(json_data, f, indent=2, default=str)
@@ -84,11 +93,38 @@ def generate_csv_report(data: Dict[str, Any], file_path: str) -> bool:
                 }
                 rows.append(row)
         elif 'activities' in data:
+<<<<<<< HEAD
             for activity in data['activities']:
                 violation_info = activity.get('violation', {})
                 row = {
                     'Activity_ID': activity.get('activity_id', ''),
                     'Student_Name': activity.get('student_name', ''),
+=======
+            if data.get('report_type') == 'invigilator':
+                viol = data.get('invigilator_violations') or []
+                routine = data.get('invigilation_activity') or []
+                for activity in viol + routine:
+                    row = {
+                        'Section': 'Violations' if activity.get('activity_category') == 'violation' else 'Invigilation activity',
+                        'Invigilator_Name': activity.get('invigilator_name', ''),
+                        'Exam': activity.get('exam_course', ''),
+                        'Exam_Date': activity.get('exam_date', ''),
+                        'Exam_Scheduled_Time': activity.get('exam_time_range', ''),
+                        'Room': activity.get('room_name', ''),
+                        'Timestamp': activity.get('timestamp', ''),
+                        'Activity_Type': activity.get('activity_type', ''),
+                        'Duration_Seconds': activity.get('duration_seconds', '') if activity.get('duration_seconds') is not None else '',
+                        'Severity': activity.get('severity', '') or '',
+                        'Notes': activity.get('notes', '') or '',
+                    }
+                    rows.append(row)
+            else:
+                for activity in data['activities']:
+                    violation_info = activity.get('violation', {})
+                    row = {
+                        'Activity_ID': activity.get('activity_id', ''),
+                        'Student_Name': activity.get('student_name', ''),
+>>>>>>> b003b4f5d912c3823aed770b8cd4e0da7e87090c
                     'Roll_Number': activity.get('student_roll_number', ''),
                     'Activity_Type': activity.get('activity_type', ''),
                     'Timestamp': activity.get('timestamp', ''),
@@ -192,9 +228,21 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
         
         if 'exam' in data:
             exam_info = data['exam']
+<<<<<<< HEAD
             metadata_data.append(['Exam:', exam_info.get('name', 'N/A')])
             metadata_data.append(['Exam Date:', exam_info.get('date', 'N/A')])
         
+=======
+            metadata_data.append(['Exam:', _cell_para(exam_info.get('name', 'N/A'))])
+            metadata_data.append(['Exam Date:', _cell_para(exam_info.get('date', 'N/A'))])
+        if data.get('report_type') == 'invigilator' and data.get('invigilator_header_lines'):
+            for i, line in enumerate(data['invigilator_header_lines']):
+                metadata_data.append([
+                    'Invigilation context:' if i == 0 else '',
+                    _cell_para(line),
+                ])
+
+>>>>>>> b003b4f5d912c3823aed770b8cd4e0da7e87090c
         metadata_table = Table(metadata_data, colWidths=[2*inch, 4*inch])
         metadata_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f7fafc')),
@@ -225,9 +273,25 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
             if 'exam_name' in summary:
                 summary_data.append(['Exam Name', summary['exam_name']])
             if 'exam_date' in summary:
+<<<<<<< HEAD
                 summary_data.append(['Exam Date', summary['exam_date']])
             
             # Add severity breakdown if available
+=======
+                summary_data.append([_cell_para('Exam Date'), _cell_para(summary['exam_date'])])
+            if 'invigilator_violations_count' in summary:
+                summary_data.append([
+                    _cell_para('Violations (policy)'),
+                    _cell_para(str(summary['invigilator_violations_count'])),
+                ])
+            if 'invigilation_activity_count' in summary:
+                summary_data.append([
+                    _cell_para('Invigilation activity (non-violations)'),
+                    _cell_para(str(summary['invigilation_activity_count'])),
+                ])
+
+            severity_breakdown_start_row = None
+>>>>>>> b003b4f5d912c3823aed770b8cd4e0da7e87090c
             if 'severity_breakdown' in summary:
                 severity = summary['severity_breakdown']
                 story.append(Spacer(1, 0.1*inch))
@@ -252,9 +316,206 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
             story.append(Spacer(1, 0.4*inch))
         
         # Detailed Activities and Violations section
+<<<<<<< HEAD
         if 'activities' in data and data['activities']:
             story.append(Paragraph("Detailed Violation Report", heading_style))
             story.append(Spacer(1, 0.1*inch))
+=======
+        if data.get('report_type') == 'invigilator':
+                viol = data.get('invigilator_violations') or []
+                routine = data.get('invigilation_activity') or []
+                mode = data.get('invigilator_report_mode') or ''
+
+                def _compact_row(act: Dict[str, Any], show_severity: bool) -> list:
+                    ts = act.get('timestamp', 'N/A')
+                    ts_disp = ts if not (isinstance(ts, str) and len(ts) > 22) else ts[:10] + '…' + ts[-8:]
+                    dur = act.get('duration_seconds')
+                    dur_s = f"{float(dur):.0f}" if dur is not None else '—'
+                    row = [
+                        _cell_para(ts_disp),
+                        _cell_para(act.get('activity_type') or 'N/A'),
+                        _cell_para(dur_s),
+                    ]
+                    if show_severity:
+                        row.append(_cell_para(act.get('severity') or '—'))
+                    row.append(_cell_para((act.get('notes') or '').strip() or '—'))
+                    return row
+
+                def _render_compact_table(title: str, items: List[Dict[str, Any]], *, show_severity: bool, header_bg: str):
+                    story.append(Paragraph(title, heading_style))
+                    story.append(Spacer(1, 0.08*inch))
+                    hdr = [_cell_para('Observed'), _cell_para('Activity'), _cell_para('Dur(s)')]
+                    widths = [1.05*inch, 1.65*inch, 0.6*inch]
+                    if show_severity:
+                        hdr.append(_cell_para('Severity'))
+                        widths.append(0.8*inch)
+                    hdr.append(_cell_para('Notes'))
+                    widths.append(2.4*inch if show_severity else 3.2*inch)
+                    rows = [hdr] + [_compact_row(a, show_severity) for a in items[:120]]
+                    if len(items) > 120:
+                        rows.append(['…', f'{len(items) - 120} more', '', '', ''][:len(hdr)])
+                    t = Table(rows, colWidths=widths)
+                    t.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(header_bg)),
+                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                        ('FONTSIZE', (0, 0), (-1, -1), 7),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+                        ('TOPPADDING', (0, 0), (-1, -1), 3),
+                        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7fafc')]),
+                        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                    ]))
+                    story.append(t)
+                    story.append(Spacer(1, 0.2*inch))
+
+                # Single invigilator + single exam: exam/invigilator details are already in metadata, so keep compact table only.
+                if mode == 'single_exam_detailed':
+                    # Explicit exam details table (shown once)
+                    exam_name = (viol[0].get('exam_course') if viol else None) or (routine[0].get('exam_course') if routine else 'N/A')
+                    exam_date = (viol[0].get('exam_date') if viol else None) or (routine[0].get('exam_date') if routine else 'N/A')
+                    exam_time = (viol[0].get('exam_time_range') if viol else None) or (routine[0].get('exam_time_range') if routine else 'N/A')
+                    room_name = (viol[0].get('room_name') if viol else None) or (routine[0].get('room_name') if routine else 'N/A')
+                    inv_name = (viol[0].get('invigilator_name') if viol else None) or (routine[0].get('invigilator_name') if routine else 'N/A')
+                    exam_info_data = [
+                        [_cell_para('Invigilator'), _cell_para(inv_name)],
+                        [_cell_para('Exam'), _cell_para(exam_name)],
+                        [_cell_para('Exam Date'), _cell_para(exam_date)],
+                        [_cell_para('Scheduled Time'), _cell_para(exam_time)],
+                        [_cell_para('Room'), _cell_para(room_name)],
+                    ]
+                    exam_info_table = Table(exam_info_data, colWidths=[1.5*inch, 4.5*inch])
+                    exam_info_table.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f7fafc')),
+                        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                        ('FONTSIZE', (0, 0), (-1, -1), 8),
+                        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                    ]))
+                    story.append(Paragraph("Exam Details", heading_style))
+                    story.append(exam_info_table)
+                    story.append(Spacer(1, 0.08*inch))
+                    _render_compact_table("Violations", viol, show_severity=True, header_bg='#b91c1c')
+                    if data.get('invigilator_include_routine', True):
+                        _render_compact_table("Invigilation activity", routine, show_severity=False, header_bg='#6e5ae6')
+
+                # Single invigilator + all exams: separate exam sections, avoid redundant columns.
+                elif mode == 'single_all_exams_violations':
+                    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+                    for a in viol:
+                        ex = a.get('exam_course') or 'Unknown Exam'
+                        dt = a.get('exam_date') or 'N/A'
+                        tm = a.get('exam_time_range') or 'N/A'
+                        rm = a.get('room_name') or 'N/A'
+                        key = f"{ex} | {dt} | {tm} | Room {rm}"
+                        grouped[key].append(a)
+                    story.append(Paragraph("Violations by Exam", heading_style))
+                    story.append(Spacer(1, 0.08*inch))
+                    for section, items in grouped.items():
+                        story.append(Paragraph(f"<b>{html.escape(section)}</b>", styles['Normal']))
+                        story.append(Spacer(1, 0.05*inch))
+                        # Exam details table for each exam section
+                        first = items[0] if items else {}
+                        sec_info = [
+                            [_cell_para('Invigilator'), _cell_para(first.get('invigilator_name') or 'N/A')],
+                            [_cell_para('Exam'), _cell_para(first.get('exam_course') or 'N/A')],
+                            [_cell_para('Exam Date'), _cell_para(first.get('exam_date') or 'N/A')],
+                            [_cell_para('Scheduled Time'), _cell_para(first.get('exam_time_range') or 'N/A')],
+                            [_cell_para('Room'), _cell_para(first.get('room_name') or 'N/A')],
+                        ]
+                        sec_info_table = Table(sec_info, colWidths=[1.5*inch, 4.5*inch])
+                        sec_info_table.setStyle(TableStyle([
+                            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f7fafc')),
+                            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                            ('FONTSIZE', (0, 0), (-1, -1), 8),
+                            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                        ]))
+                        story.append(sec_info_table)
+                        story.append(Spacer(1, 0.05*inch))
+                        _render_compact_table(" ", items, show_severity=True, header_bg='#b91c1c')
+
+                # Default (all invigilators mode): split by invigilator + exam session with per-section headings/tables.
+                else:
+                    grouped: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
+                    for a in viol:
+                        key = (
+                            a.get('invigilator_name') or 'N/A',
+                            a.get('exam_course') or 'Unknown Exam',
+                            a.get('exam_date') or 'N/A',
+                            a.get('exam_time_range') or 'N/A',
+                            a.get('room_name') or 'N/A',
+                        )
+                        grouped[key].append(a)
+
+                    story.append(Paragraph("Violations by Invigilator and Exam", heading_style))
+                    story.append(Spacer(1, 0.08*inch))
+
+                    for (inv_name, ex, dt, tm, rm), items in grouped.items():
+                        story.append(Paragraph(f"<b>{html.escape(inv_name)} — {html.escape(ex)}</b>", styles['Normal']))
+                        info_data = [
+                            [_cell_para('Exam Date'), _cell_para(dt)],
+                            [_cell_para('Scheduled Time'), _cell_para(tm)],
+                            [_cell_para('Room'), _cell_para(rm)],
+                        ]
+                        info_table = Table(info_data, colWidths=[1.5*inch, 4.5*inch])
+                        info_table.setStyle(TableStyle([
+                            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f7fafc')),
+                            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                            ('FONTSIZE', (0, 0), (-1, -1), 8),
+                            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                        ]))
+                        story.append(info_table)
+                        story.append(Spacer(1, 0.06*inch))
+                        _render_compact_table("Violations", items, show_severity=True, header_bg='#b91c1c')
+        elif 'activities' in data and data['activities']:
+            if data.get('violation_view') == 'summary' and data.get('aggregated_violations'):
+                story.append(Paragraph("Violations by student (type, severity, frequency)", heading_style))
+                story.append(Spacer(1, 0.1*inch))
+                agg_headers = [[_cell_para('Student'), _cell_para('Roll No'), _cell_para('Violation Type'), _cell_para('Severity'), _cell_para('Frequency'), _cell_para('Evidence (video links)')]]
+                agg_col_widths = [1.3*inch, 0.75*inch, 1.4*inch, 0.65*inch, 0.55*inch, 1.8*inch]
+                for row in data['aggregated_violations']:
+                    urls = row.get('evidence_urls') or []
+                    links_str = ", ".join(str(u) for u in urls[:3]) if urls else "—"
+                    agg_headers.append([
+                        _cell_para(row.get('student_name') or 'N/A'),
+                        _cell_para(row.get('student_roll_number') or 'N/A'),
+                        _cell_para(row.get('activity_type') or 'N/A'),
+                        (row.get('severity') or 'N/A'),
+                        str(row.get('frequency', 0)),
+                        _cell_para(links_str),
+                    ])
+                agg_style = [
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#6e5ae6')),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                    ('FONTSIZE', (0, 0), (-1, -1), 8),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7fafc')]),
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ]
+                for r in range(1, len(agg_headers)):
+                    if len(agg_headers[r]) > 3:
+                        sev = (agg_headers[r][3] or "N/A").strip()
+                        bg, tx = _severity_pdf_colors(sev)
+                        agg_style.append(('BACKGROUND', (3, r), (3, r), colors.HexColor(bg)))
+                        agg_style.append(('TEXTCOLOR', (3, r), (3, r), colors.HexColor(tx)))
+                agg_table = Table(agg_headers, colWidths=agg_col_widths)
+                agg_table.setStyle(TableStyle(agg_style))
+                story.append(agg_table)
+                story.append(Spacer(1, 0.3*inch))
+            else:
+                story.append(Paragraph("Detailed Violation Report", heading_style))
+                story.append(Spacer(1, 0.1*inch))
+>>>>>>> b003b4f5d912c3823aed770b8cd4e0da7e87090c
             
             # Create detailed table with violations
             activities_data = [[
@@ -267,6 +528,7 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
                 'Status'
             ]]
             
+<<<<<<< HEAD
             for activity in data['activities'][:100]:  # Show up to 100 activities
                 violation_info = activity.get('violation', {})
                 
@@ -284,6 +546,39 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
                     violation_info.get('type', 'N/A') if violation_info else 'N/A',
                     violation_info.get('status', 'N/A') if violation_info else 'N/A'
                 ])
+=======
+                for activity in data['activities'][:100]:  # Show up to 100 activities
+                    violation_info = activity.get('violation', {})
+                    student_name = activity.get('student_name', 'Unknown')
+                    if len(student_name) > 20:
+                        student_name = student_name[:17] + '...'
+                    exam_display = (activity.get('exam_name') or '') + (' ' + (activity.get('exam_date') or '') if activity.get('exam_date') else '')
+                    if len(exam_display) > 14:
+                        exam_display = exam_display[:11] + '...'
+                    ev_url = activity.get('evidence_url') or 'N/A'
+                    if ev_url and ev_url != 'N/A' and (ev_url.startswith('http://') or ev_url.startswith('https://')):
+                        evidence_cell = Paragraph(f'<a href="{ev_url}" color="#0066cc">View</a>', styles['Normal'])
+                    else:
+                        evidence_cell = ev_url[:8] + '...' if ev_url and len(str(ev_url)) > 8 else (ev_url or '-')
+                    ts_raw = activity.get('timestamp', 'N/A')
+                    if isinstance(ts_raw, str) and len(ts_raw) > 12:
+                        time_str = ts_raw[-8:]
+                    else:
+                        time_str = str(ts_raw)
+                    row = [
+                        _cell_para(student_name),
+                        _cell_para(activity.get('student_roll_number') or 'N/A'),
+                        _cell_para(activity.get('activity_type') or 'N/A'),
+                        time_str,
+                        str(activity.get('severity', 'N/A')),
+                        violation_info.get('type', 'N/A') if violation_info else 'N/A',
+                        violation_info.get('status', 'N/A') if violation_info else 'N/A',
+                        evidence_cell
+                    ]
+                    if has_per_activity_exam:
+                        row.insert(2, _cell_para(exam_display))
+                    activities_data.append(row)
+>>>>>>> b003b4f5d912c3823aed770b8cd4e0da7e87090c
             
             if len(data['activities']) > 100:
                 activities_data.append([
@@ -315,7 +610,16 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
         # Violation section
         if 'violation' in data and data['violation']:
             story.append(Paragraph("Violation Details", heading_style))
+<<<<<<< HEAD
             violation = data['violation']
+=======
+            violation = viol_data
+            sev_val = str(violation.get('severity', 'N/A'))
+            ev_url = violation.get('evidence_url') or 'N/A'
+            evidence_row = ['Evidence:', ev_url]
+            if ev_url and ev_url != 'N/A' and (str(ev_url).startswith('http://') or str(ev_url).startswith('https://')):
+                evidence_row[1] = Paragraph(f'<a href="{ev_url}" color="#0066cc">View evidence image</a>', styles['Normal'])
+>>>>>>> b003b4f5d912c3823aed770b8cd4e0da7e87090c
             violation_data = [
                 ['Violation ID:', violation.get('id', 'N/A')],
                 ['Type:', violation.get('type', 'N/A')],
@@ -549,6 +853,175 @@ async def generate_report_file_async(
         db.close()
         logger.info("generate_report_file_async: done report_id=%s", report_id)
 
+<<<<<<< HEAD
+=======
+
+async def generate_invigilator_report_file_async(
+    report_id: UUID,
+    file_path: str,
+    format_type: str,
+    invigilator_id: Optional[UUID] = None,
+    exam_id: Optional[UUID] = None,
+    report_mode: str = "all_invigilators_violations",
+):
+    """Background task: invigilator duty report (violations vs invigilation activity, with exam / room / time)."""
+    logger.info(
+        "generate_invigilator_report_file_async: start report_id=%s file_path=%s format=%s invigilator_id=%s exam_id=%s mode=%s",
+        report_id, file_path, format_type, invigilator_id, exam_id, report_mode
+    )
+    db = SessionLocal()
+    try:
+        def _build_query(fallback_legacy: bool = False):
+            if fallback_legacy:
+                q = db.query(
+                    InvigilatorActivity.activity_id.label("activity_id"),
+                    InvigilatorActivity.invigilator_id.label("invigilator_id"),
+                    InvigilatorActivity.room_id.label("room_id"),
+                    InvigilatorActivity.timestamp.label("timestamp"),
+                    InvigilatorActivity.activity_type.label("activity_type"),
+                    InvigilatorActivity.notes.label("notes"),
+                )
+            else:
+                q = db.query(InvigilatorActivity)
+            if report_mode in ("single_exam_detailed", "single_all_exams_violations") and invigilator_id:
+                q = q.filter(InvigilatorActivity.invigilator_id == invigilator_id)
+            if report_mode == "single_exam_detailed" and exam_id:
+                q = q.join(Room, Room.room_id == InvigilatorActivity.room_id).filter(Room.exam_id == exam_id)
+            return q.order_by(InvigilatorActivity.timestamp.desc())
+
+        legacy_fallback = False
+        try:
+            activities = _build_query(False).all()
+        except ProgrammingError as e:
+            db.rollback()
+            if "invigilator_activities.severity" in str(e):
+                logger.warning("Falling back to legacy invigilator_activities schema (no severity/activity_category/duration)")
+                legacy_fallback = True
+                activities = _build_query(True).all()
+            else:
+                raise
+        detailed = []
+        exam_keys: Dict[str, Any] = {}
+        for act in activities:
+            inv = db.query(Invigilator).filter(Invigilator.invigilator_id == act.invigilator_id).first()
+            room = db.query(Room).filter(Room.room_id == act.room_id).first()
+            exam = None
+            if room and room.exam_id:
+                exam = db.query(Exam).filter(Exam.exam_id == room.exam_id).first()
+                exam_keys[str(room.exam_id)] = (exam, room)
+            if room:
+                room_display = f"{room.block}-{room.room_number}" if room.block else str(room.room_number)
+            else:
+                room_display = "N/A"
+            exam_course = exam.course if exam else "N/A"
+            exam_date = str(exam.exam_date) if exam and exam.exam_date else ""
+            if exam and exam.start_time and exam.end_time:
+                exam_time_range = (
+                    f"{exam.start_time.strftime('%H:%M')}–{exam.end_time.strftime('%H:%M')}"
+                )
+            elif exam and exam.start_time:
+                exam_time_range = exam.start_time.strftime('%H:%M')
+            else:
+                exam_time_range = ""
+            cat = (None if legacy_fallback else getattr(act, "activity_category", None)) or "invigilation_activity"
+            if cat not in ("violation", "invigilation_activity"):
+                cat = "invigilation_activity"
+            dur = None if legacy_fallback else getattr(act, "duration_seconds", None)
+            detailed.append({
+                'activity_id': str(act.activity_id),
+                'invigilator_name': inv.name if inv else 'N/A',
+                'room_name': room_display,
+                'timestamp': act.timestamp.strftime('%Y-%m-%d %H:%M:%S') if act.timestamp else '',
+                'activity_type': act.activity_type or 'N/A',
+                'severity': ('' if legacy_fallback else (getattr(act, 'severity', None) or '')),
+                'notes': act.notes or '',
+                'activity_category': cat,
+                'duration_seconds': dur,
+                'exam_course': exam_course,
+                'exam_date': exam_date,
+                'exam_time_range': exam_time_range,
+            })
+
+        violations = [r for r in detailed if r.get('activity_category') == 'violation']
+        include_routine = report_mode == "single_exam_detailed"
+        routine = [r for r in detailed if r.get('activity_category') != 'violation'] if include_routine else []
+
+        header_lines: List[str] = []
+        if len(exam_keys) == 1:
+            ex, rm = next(iter(exam_keys.values()))
+            if ex and rm:
+                st = ex.start_time.strftime('%H:%M') if ex.start_time else ''
+                en = ex.end_time.strftime('%H:%M') if ex.end_time else ''
+                tr = f"{st} – {en}" if (st and en) else (st or en or "")
+                rlabel = f"{rm.block}-{rm.room_number}" if rm.block else str(rm.room_number)
+                header_lines = [
+                    f"Exam / course: {ex.course}",
+                    f"Exam date: {ex.exam_date}",
+                    f"Scheduled exam time: {tr}",
+                    f"Room: {rlabel}",
+                ]
+        elif len(exam_keys) > 1:
+            header_lines = [
+                "Multiple exam sessions are included; each row lists the exam, scheduled time, and room.",
+            ]
+        else:
+            header_lines = [
+                "Link activities to exams by assigning rooms to exams and invigilators via Invigilator Plans.",
+            ]
+
+        report_data = {
+            'title': 'Invigilator duty report',
+            'generated_at': datetime.utcnow().isoformat(),
+            'report_type': 'invigilator',
+            'invigilator_report_mode': report_mode,
+            'invigilator_include_routine': include_routine,
+            'activities': detailed,
+            'invigilator_violations': violations,
+            'invigilation_activity': routine,
+            'invigilator_header_lines': header_lines,
+            'summary': {
+                'total_activities': len(detailed) if include_routine else len(violations),
+                'invigilator_violations_count': len(violations),
+                'invigilation_activity_count': len(routine),
+            },
+        }
+        success = False
+        if format_type.lower() == 'json':
+            success = generate_json_report(report_data, file_path)
+        elif format_type.lower() == 'csv':
+            success = generate_csv_report(report_data, file_path)
+        elif format_type.lower() == 'pdf':
+            success = generate_pdf_report(report_data, file_path)
+        else:
+            success = generate_json_report(report_data, file_path)
+        report = db.query(Report).filter(Report.report_id == report_id).first()
+        if report:
+            if success:
+                report.status = "completed"
+                base_name = Path(file_path).stem
+                for ext in ['.pdf', '.txt', '.csv', '.json']:
+                    test_file = REPORTS_DIR / f"{base_name}{ext}"
+                    if test_file.exists():
+                        report.file_path = f"/reports/{test_file.name}"
+                        break
+            else:
+                report.status = "failed"
+            db.commit()
+    except Exception as e:
+        logger.exception("generate_invigilator_report_file_async failed: report_id=%s error=%s", report_id, e)
+        try:
+            r = db.query(Report).filter(Report.report_id == report_id).first()
+            if r:
+                r.status = "failed"
+                db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+        logger.info("generate_invigilator_report_file_async: done report_id=%s", report_id)
+
+
+>>>>>>> b003b4f5d912c3823aed770b8cd4e0da7e87090c
 # -------------------------
 # Helper Functions
 # -------------------------
@@ -668,6 +1141,9 @@ class StudentReportRequest(BaseModel):
 class InvigilatorReportRequest(BaseModel):
     format: str  # pdf, csv, json
     include_statistics: Optional[bool] = True
+    invigilator_id: Optional[UUID] = None
+    exam_id: Optional[UUID] = None
+    report_mode: Optional[str] = "all_invigilators_violations"
 
 
 class ReportListItem(BaseModel):
@@ -690,9 +1166,93 @@ class ReportListResponse(BaseModel):
     total: int
 
 
+class InvigilatorOption(BaseModel):
+    invigilator_id: UUID
+    name: str
+    email: Optional[str] = None
+
+
+class InvigilatorExamOption(BaseModel):
+    exam_id: UUID
+    name: str
+    exam_date: Optional[str] = None
+
+
 # -------------------------
 # CRUD Routes
 # -------------------------
+
+@router.get("/invigilators/options", response_model=List[InvigilatorOption])
+def get_invigilator_options(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Lightweight invigilator list for report dropdowns."""
+    if current_user.get("user_type") not in ["admin", "investigator"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    rows = db.query(Invigilator).order_by(Invigilator.name.asc()).all()
+    return [
+        InvigilatorOption(
+            invigilator_id=r.invigilator_id,
+            name=r.name or "Unknown",
+            email=r.email,
+        )
+        for r in rows
+    ]
+
+
+@router.get("/invigilators/{invigilator_id}/exam-options", response_model=List[InvigilatorExamOption])
+def get_exam_options_for_invigilator(
+    invigilator_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Return only exams that this invigilator has monitored (based on invigilator_activities)."""
+    if current_user.get("user_type") not in ["admin", "investigator"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    inv = db.query(Invigilator).filter(Invigilator.invigilator_id == invigilator_id).first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invigilator not found")
+
+    # Include exams from BOTH:
+    # 1) invigilator plans (assignments), and
+    # 2) actual recorded invigilator activities.
+    exam_by_id: Dict[UUID, Exam] = {}
+
+    assigned_exams = (
+        db.query(Exam)
+        .join(ExamInvigilatorAssignment, ExamInvigilatorAssignment.exam_id == Exam.exam_id)
+        .filter(ExamInvigilatorAssignment.invigilator_id == invigilator_id)
+        .all()
+    )
+    for e in assigned_exams:
+        exam_by_id[e.exam_id] = e
+
+    activity_exams = (
+        db.query(Exam)
+        .join(Room, Room.exam_id == Exam.exam_id)
+        .join(InvigilatorActivity, InvigilatorActivity.room_id == Room.room_id)
+        .filter(InvigilatorActivity.invigilator_id == invigilator_id)
+        .distinct()
+        .all()
+    )
+    for e in activity_exams:
+        exam_by_id[e.exam_id] = e
+
+    rows = sorted(
+        exam_by_id.values(),
+        key=lambda e: (e.exam_date or date.min),
+        reverse=True,
+    )
+    return [
+        InvigilatorExamOption(
+            exam_id=e.exam_id,
+            name=e.course or "Unnamed Exam",
+            exam_date=e.exam_date.strftime("%Y-%m-%d") if e.exam_date else None,
+        )
+        for e in rows
+    ]
 
 # CREATE (Admin Only)
 @router.post("/", response_model=ReportRead, status_code=status.HTTP_201_CREATED)
@@ -908,7 +1468,178 @@ def generate_exam_report(
         format_type=request.format,
         activities=activities,
         exam=exam,
+<<<<<<< HEAD
         violation=violation
+=======
+        violation=violation,
+        violation_view=getattr(request, "violation_view", None) or "all",
+    )
+
+    return {
+        "id": str(new_report.report_id),
+        "file_path": file_path,
+        "format": request.format,
+        "status": "generating"
+    }
+
+
+# -------------------------
+# Generate Invigilator Report
+# -------------------------
+@router.post("/invigilators", status_code=status.HTTP_201_CREATED)
+def generate_invigilator_report(
+    request: InvigilatorReportRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Generate a report of all invigilator activities."""
+    logger.info(
+        "generate_invigilator_report: format=%s invigilator_id=%s exam_id=%s mode=%s",
+        request.format, request.invigilator_id, request.exam_id, request.report_mode
+    )
+    if current_user.get("user_type") not in ["admin", "investigator"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"invigilator_report_{timestamp}.{request.format}"
+    file_path = os.path.join("reports", filename)
+    investigator_id = get_investigator_id_for_report(current_user, db)
+    mode = (request.report_mode or "all_invigilators_violations").strip()
+    valid_modes = {"all_invigilators_violations", "single_exam_detailed", "single_all_exams_violations"}
+    if mode not in valid_modes:
+        raise HTTPException(status_code=400, detail="Invalid report_mode")
+
+    selected_inv_name = None
+    if mode in {"single_exam_detailed", "single_all_exams_violations"}:
+        if not request.invigilator_id:
+            raise HTTPException(status_code=400, detail="invigilator_id is required for selected report mode")
+        selected_inv = db.query(Invigilator).filter(
+            Invigilator.invigilator_id == request.invigilator_id
+        ).first()
+        if not selected_inv:
+            raise HTTPException(status_code=404, detail="Selected invigilator not found")
+        selected_inv_name = selected_inv.name
+    if mode == "single_exam_detailed":
+        if not request.exam_id:
+            raise HTTPException(status_code=400, detail="exam_id is required for single_exam_detailed mode")
+        exam_check = db.query(Exam).filter(Exam.exam_id == request.exam_id).first()
+        if not exam_check:
+            raise HTTPException(status_code=404, detail="Selected exam not found")
+    initial_name = (
+        f"Invigilator Report - {selected_inv_name} - {datetime.utcnow().strftime('%Y-%m-%d')}"
+        if selected_inv_name
+        else f"Invigilator Report - {datetime.utcnow().strftime('%Y-%m-%d')}"
+    )
+    new_report = Report(
+        name=initial_name,
+        report_type="invigilator",
+        file_path=file_path,
+        violation_id=None,
+        generated_by=investigator_id,
+        status="generating"
+    )
+    db.add(new_report)
+    db.commit()
+    db.refresh(new_report)
+    background_tasks.add_task(
+        generate_invigilator_report_file_async,
+        report_id=new_report.report_id,
+        file_path=file_path,
+        format_type=request.format,
+        invigilator_id=request.invigilator_id,
+        exam_id=request.exam_id,
+        report_mode=mode,
+    )
+    return {
+        "id": str(new_report.report_id),
+        "file_path": file_path,
+        "format": request.format,
+        "status": "generating"
+    }
+
+
+# -------------------------
+# Generate Student Violations Report (one student, all exams)
+# -------------------------
+@router.post("/students/{student_id}")
+def generate_student_report(
+    student_id: UUID,
+    request: StudentReportRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Generate a report for a single student showing their violations across all exams.
+    """
+    logger.info("generate_student_report: student_id=%s format=%s", student_id, request.format)
+    if current_user.get("user_type") not in ["admin", "investigator"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    student = db.query(Student).filter(Student.student_id == student_id).first()
+    if not student:
+        logger.warning("generate_student_report: student not found student_id=%s", student_id)
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    # All activities (violations/incidents) for this student, any exam, newest first
+    activities = (
+        db.query(StudentActivity)
+        .filter(StudentActivity.student_id == student_id)
+        .order_by(StudentActivity.timestamp.desc())
+        .all()
+    )
+    logger.info("generate_student_report: student_id=%s activities_count=%s", student_id, len(activities))
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"student_report_{student_id}_{timestamp}.{request.format}"
+    file_path = os.path.join("reports", filename)
+
+    violation = None
+    if activities:
+        violation = db.query(Violation).filter(
+            Violation.activity_id == activities[0].activity_id
+        ).first()
+    if not violation and activities:
+        violation = Violation(
+            activity_id=activities[0].activity_id,
+            violation_type="Student Report",
+            severity=1,
+            status="pending"
+        )
+        db.add(violation)
+        db.commit()
+        db.refresh(violation)
+
+    investigator_id = get_investigator_id_for_report(current_user, db)
+    initial_name = f"Student Report - {student.name or 'Student'} ({student.roll_number or student_id}) - Violations across exams"
+    new_report = Report(
+        name=initial_name,
+        report_type="student",
+        file_path=file_path,
+        violation_id=violation.violation_id if violation else None,
+        generated_by=investigator_id,
+        status="generating"
+    )
+    db.add(new_report)
+    db.commit()
+    db.refresh(new_report)
+
+    logger.info(
+        "generate_student_report: adding background task report_id=%s student_id=%s format=%s",
+        new_report.report_id, student_id, request.format,
+    )
+    background_tasks.add_task(
+        generate_report_file_async,
+        report_id=new_report.report_id,
+        report_type="student",
+        file_path=file_path,
+        format_type=request.format,
+        activities=activities,
+        exam=None,
+        violation=violation,
+        violation_view=getattr(request, "violation_view", None) or "all",
+>>>>>>> b003b4f5d912c3823aed770b8cd4e0da7e87090c
     )
 
     return {

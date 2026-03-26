@@ -490,6 +490,7 @@ class VideoStreamHandler:
             "total_frames": total_frames,
             "extracted_frames": len(frames),
             "fps": fps,
+            "frame_extraction_rate": frame_extraction_rate,
             "duration": validation['duration'],
             "frames_info": frames,
             "seat_map": seat_map,

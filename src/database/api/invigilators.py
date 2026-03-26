@@ -87,9 +87,9 @@ def get_invigilators(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    if current_user["user_type"] != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can view invigilators")
-    return db.query(Invigilator).all()
+    if current_user["user_type"] not in ("admin", "investigator"):
+        raise HTTPException(status_code=403, detail="Only admins and investigators can view invigilators")
+    return db.query(Invigilator).order_by(Invigilator.name).all()
 
 
 # READ one (self or admin)

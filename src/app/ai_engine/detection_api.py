@@ -84,7 +84,7 @@ async def run_detection(
 
     try:
         cfg = Config()
-        results, annotated = run_on_image(
+        results, annotated, _, _ = run_on_image(
             img,
             cfg=cfg,
             save_output=False,
