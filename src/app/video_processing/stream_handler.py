@@ -457,12 +457,8 @@ class VideoStreamHandler:
         logger.info(f"Processing recorded video: {video_path}")
         logger.info(f"Total frames: {total_frames}, FPS: {fps}")
         
-        # Extract frames (every 30 frames = ~1 per second for 30fps video)
-        # But reduce rate for shorter videos to get more frames
+        # Extract 1 frame per second: take every Nth frame where N = fps
         frame_extraction_rate = max(1, int(fps))
-        # For videos with fewer frames, extract more frequently
-        if total_frames < 1000:
-            frame_extraction_rate = max(1, int(fps // 2))  # Extract every 15 frames for shorter videos
         
         # Calculate expected extracted frames
         expected_extracted = (total_frames // frame_extraction_rate) + (1 if total_frames % frame_extraction_rate > 0 else 0)
