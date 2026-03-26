@@ -158,6 +158,9 @@ class InvigilatorActivity(Base):
     room_id = Column(UUID(as_uuid=True), ForeignKey("rooms.room_id"))
     timestamp = Column(DateTime, default=datetime.utcnow)
     activity_type = Column(String)
+    severity = Column(String, nullable=True)  # low | medium | high | critical (violations only)
+    activity_category = Column(String, default="invigilation_activity")  # violation | invigilation_activity
+    duration_seconds = Column(Float, nullable=True)
     notes = Column(Text)
 
     invigilator = relationship("Invigilator", back_populates="activities")

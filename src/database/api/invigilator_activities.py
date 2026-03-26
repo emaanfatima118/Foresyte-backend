@@ -19,6 +19,9 @@ class InvigilatorActivityCreate(BaseModel):
     room_id: UUID
     activity_type: str
     notes: Optional[str] = None
+    severity: Optional[str] = None
+    activity_category: Optional[str] = None
+    duration_seconds: Optional[float] = None
 
 
 class InvigilatorActivityRead(BaseModel):
@@ -27,7 +30,10 @@ class InvigilatorActivityRead(BaseModel):
     room_id: UUID
     timestamp: datetime
     activity_type: str
-    notes: Optional[str]
+    severity: Optional[str] = None
+    activity_category: Optional[str] = None
+    duration_seconds: Optional[float] = None
+    notes: Optional[str] = None
 
     model_config = {
         "from_attributes": True
@@ -41,6 +47,9 @@ class InvigilatorActivityEnriched(InvigilatorActivityRead):
 
 class InvigilatorActivityUpdate(BaseModel):
     activity_type: Optional[str] = None
+    severity: Optional[str] = None
+    activity_category: Optional[str] = None
+    duration_seconds: Optional[float] = None
     notes: Optional[str] = None
 
 
@@ -90,6 +99,9 @@ def _enrich_activity(db: Session, row: InvigilatorActivity) -> InvigilatorActivi
         room_id=row.room_id,
         timestamp=row.timestamp,
         activity_type=row.activity_type,
+        severity=getattr(row, "severity", None),
+        activity_category=getattr(row, "activity_category", None),
+        duration_seconds=getattr(row, "duration_seconds", None),
         notes=row.notes,
         invigilator_name=inv.name if inv else None,
         room_number=room_label,

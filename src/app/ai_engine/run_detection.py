@@ -18,7 +18,8 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from math import hypot
+from typing import Optional, Tuple, List, Dict, Any
 
 from dotenv import load_dotenv
 
@@ -302,6 +303,99 @@ def filter_seated(detections: list[Detection], cfg: Config) -> tuple[list[Detect
     return seated, skipped
 
 
+def split_seated_standing(
+    detections: list[Detection], cfg: Config
+) -> tuple[list[Detection], list[Detection]]:
+    """Split person detections into seated (students) vs standing (typical invigilator)."""
+    seated, standing = [], []
+    for det in detections:
+        x1, y1, x2, y2 = det.bbox
+        bw = max(1, x2 - x1)
+        bh = y2 - y1
+        aspect = bh / bw
+        if aspect > cfg.standing_aspect_ratio:
+            standing.append(det)
+        else:
+            seated.append(det)
+    return seated, standing
+
+
+def _bbox_area(det: Detection) -> int:
+    x1, y1, x2, y2 = det.bbox
+    return max(0, x2 - x1) * max(0, y2 - y1)
+
+
+def _bbox_center_xy(bbox: tuple[int, int, int, int]) -> tuple[float, float]:
+    x1, y1, x2, y2 = bbox
+    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+
+def compute_invigilator_behaviors_for_frame(
+    h: int,
+    w: int,
+    persons: list[Detection],
+    seated: list[Detection],
+    standing: list[Detection],
+    cheating_model: YOLO,
+    enhanced: np.ndarray,
+    cfg: Config,
+    prev_center: Optional[tuple[float, float]],
+) -> tuple[List[Dict[str, Any]], Optional[tuple[float, float]]]:
+    """
+    Emit canonical invigilator labels: out of classroom, sitting, standing, walking, phone.
+    Walking = large bbox movement vs previous frame (same person track proxy).
+    Phone = cheating classifier on standing invigilator crop flags phone.
+    """
+    behaviors: List[Dict[str, Any]] = []
+    motion_thresh = 0.035 * max(h, w)
+
+    if not persons:
+        behaviors.append({
+            "behavior_type": "out of classroom",
+            "severity": "low",
+            "confidence": 0.55,
+            "details": "no persons detected in frame",
+        })
+        return behaviors, None
+
+    if standing:
+        best = max(standing, key=_bbox_area)
+        label, conf, _ = classify_person(cheating_model, enhanced, best.bbox, cfg)
+        cx, cy = _bbox_center_xy(best.bbox)
+        thr = cfg.class_flag_thresholds.get("phone", 0.12)
+        bt = "phone" if label == "phone" and conf >= thr else "standing"
+        if prev_center is not None and bt != "phone":
+            d = hypot(cx - prev_center[0], cy - prev_center[1])
+            if d > motion_thresh:
+                bt = "walking"
+        behaviors.append({
+            "behavior_type": bt,
+            "severity": "low",
+            "confidence": float(conf) if bt == "phone" else 0.78,
+            "details": f"standing-area bbox={best.bbox} cheat_classifier={label} ({conf:.3f})",
+        })
+        return behaviors, (cx, cy)
+
+    front = [d for d in seated if d.bbox[3] >= int(0.68 * h)]
+    if front:
+        best = max(front, key=_bbox_area)
+        cx, cy = _bbox_center_xy(best.bbox)
+        bt = "sitting"
+        if prev_center is not None:
+            d = hypot(cx - prev_center[0], cy - prev_center[1])
+            if d > motion_thresh:
+                bt = "walking"
+        behaviors.append({
+            "behavior_type": bt,
+            "severity": "low",
+            "confidence": 0.68,
+            "details": f"front-area seated bbox={best.bbox}",
+        })
+        return behaviors, (cx, cy)
+
+    return [], prev_center
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # CLASSIFICATION
 # ──────────────────────────────────────────────────────────────────────────────
@@ -464,10 +558,11 @@ def run_on_image(
     cfg: Optional[Config] = None,
     save_output: bool = False,
     output_path: Optional[Path] = None,
-) -> tuple[list[ClassificationResult], np.ndarray]:
+    invigilator_prev_center: Optional[tuple[float, float]] = None,
+) -> tuple[list[ClassificationResult], np.ndarray, List[Dict[str, Any]], Optional[tuple[float, float]]]:
     """
     Run detection pipeline on an in-memory image.
-    Returns (list of ClassificationResult, annotated image as numpy array).
+    Returns (student ClassificationResults, annotated image, invigilator behavior dicts, next invigilator center).
     """
     cfg = cfg or Config()
     if save_output:
@@ -490,13 +585,21 @@ def run_on_image(
     persons = detect_persons(person_model, enhanced, cfg)
     log.info("Raw detections after NMS: %d  (%.2fs)", len(persons), time.perf_counter() - t0)
 
-    seated, skipped = filter_seated(persons, cfg)
-    log.info("Seated: %d  |  Standing (skipped): %d", len(seated), skipped)
+    seated, standing = split_seated_standing(persons, cfg)
+    log.info("Seated: %d  |  Standing (invigilator candidates): %d", len(seated), len(standing))
+
+    inv_behaviors, next_inv_center = compute_invigilator_behaviors_for_frame(
+        h, w, persons, seated, standing, cheating_model, enhanced, cfg, invigilator_prev_center
+    )
 
     if not seated:
         log.warning("No seated persons detected — check thresholds or image.")
         annotated = draw_results(image, [], cfg)
-        return [], annotated
+        if save_output:
+            out_path = output_path or cfg.output_path
+            cv2.imwrite(str(out_path), annotated)
+            log.info("Output saved: %s", out_path)
+        return [], annotated, inv_behaviors, next_inv_center
 
     # ── Stage 2: Classify each student ──────────────────────────────────────
     log.info("Classifying %d students …", len(seated))
@@ -530,7 +633,7 @@ def run_on_image(
     if save_output:
         print_report(results, cfg)
 
-    return results, annotated
+    return results, annotated, inv_behaviors, next_inv_center
 
 
 def run(cfg: Optional[Config] = None) -> list[ClassificationResult]:
@@ -543,7 +646,7 @@ def run(cfg: Optional[Config] = None) -> list[ClassificationResult]:
         log.error("Could not load image: %s", cfg.image_path)
         return []
 
-    results, _ = run_on_image(
+    results, _, _, _ = run_on_image(
         image,
         cfg=cfg,
         save_output=True,

@@ -55,6 +55,8 @@ def run_migration():
             run_sql_file(conn, "add_report_status.sql", "Add status to reports")
             run_sql_file(conn, "add_exam_invigilator_assignments.sql", "Exam invigilator assignments")
             run_sql_file(conn, "invigilator_one_per_room.sql", "One invigilator per room (dedupe + unique)")
+            run_sql_file(conn, "add_invigilator_activity_severity.sql", "Invigilator activity severity column")
+            run_sql_file(conn, "add_invigilator_activity_category.sql", "Invigilator activity category and duration")
             conn.commit()
             logger.info("[SUCCESS] Migrations completed successfully!")
             return True
