@@ -39,7 +39,6 @@ class Invigilator(Base):
     # status = Column(String, default="active")  # active, suspended, inactive
 
     activities = relationship("InvigilatorActivity", back_populates="invigilator")
-    exam_room_assignments = relationship("ExamInvigilatorAssignment", back_populates="invigilator")
 
 
 class Investigator(Base):
@@ -86,7 +85,6 @@ class Exam(Base):
 
     rooms = relationship("Room", back_populates="exam")
     activities = relationship("StudentActivity", back_populates="exam")
-    invigilator_assignments = relationship("ExamInvigilatorAssignment", back_populates="exam")
 
 
 class Room(Base):
@@ -102,7 +100,6 @@ class Room(Base):
     exam = relationship("Exam", back_populates="rooms")
     seats = relationship("Seat", back_populates="room")
     invigilator_activities = relationship("InvigilatorActivity", back_populates="room")
-    invigilator_assignments = relationship("ExamInvigilatorAssignment", back_populates="room")
 
 
 class Seat(Base):
@@ -114,21 +111,6 @@ class Seat(Base):
 
     room = relationship("Room", back_populates="seats")
     student = relationship("Student", back_populates="seat_assignment")
-
-
-class ExamInvigilatorAssignment(Base):
-    """Exactly one invigilator per exam room (duty roster). Used for AI-logged invigilator activities and video upload checks."""
-    __tablename__ = "exam_invigilator_assignments"
-    assignment_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    exam_id = Column(UUID(as_uuid=True), ForeignKey("exams.exam_id"), nullable=False)
-    room_id = Column(UUID(as_uuid=True), ForeignKey("rooms.room_id"), nullable=False)
-    invigilator_id = Column(UUID(as_uuid=True), ForeignKey("invigilators.invigilator_id"), nullable=False)
-    is_primary = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    exam = relationship("Exam", back_populates="invigilator_assignments")
-    room = relationship("Room", back_populates="invigilator_assignments")
-    invigilator = relationship("Invigilator", back_populates="exam_room_assignments")
 
 
 # -------------------------------
@@ -154,13 +136,14 @@ class StudentActivity(Base):
 class InvigilatorActivity(Base):
     __tablename__ = "invigilator_activities"
     activity_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    invigilator_id = Column(UUID(as_uuid=True), ForeignKey("invigilators.invigilator_id"))
+    invigilator_id = Column(UUID(as_uuid=True), ForeignKey("invigilators.invigilator_id"), nullable=True)
     room_id = Column(UUID(as_uuid=True), ForeignKey("rooms.room_id"))
     timestamp = Column(DateTime, default=datetime.utcnow)
     activity_type = Column(String)
-    severity = Column(String, nullable=True)  # low | medium | high | critical (violations only)
-    activity_category = Column(String, default="invigilation_activity")  # violation | invigilation_activity
-    duration_seconds = Column(Float, nullable=True)
+    severity = Column(String, nullable=True)          # low, medium, high, critical
+    confidence = Column(Float, nullable=True)         # AI detection confidence
+    frame_number = Column(Integer, nullable=True)     # Frame in the video where detected
+    evidence_url = Column(Text, nullable=True)        # URL to evidence frame
     notes = Column(Text)
 
     invigilator = relationship("Invigilator", back_populates="activities")
@@ -206,6 +189,24 @@ class Notification(Base):
     message = Column(Text, nullable=False)
     read = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# -------------------------------
+#  INVIGILATOR PLAN / ASSIGNMENT
+# -------------------------------
+
+class ExamRoomAssignment(Base):
+    """Tracks which invigilator is assigned to each room for a given exam."""
+    __tablename__ = "exam_room_assignments"
+    assignment_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    exam_id = Column(UUID(as_uuid=True), ForeignKey("exams.exam_id"), nullable=False)
+    room_id = Column(UUID(as_uuid=True), ForeignKey("rooms.room_id"), nullable=False)
+    invigilator_id = Column(UUID(as_uuid=True), ForeignKey("invigilators.invigilator_id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    exam = relationship("Exam")
+    room = relationship("Room")
+    invigilator = relationship("Invigilator")
 
 
 # -------------------------------

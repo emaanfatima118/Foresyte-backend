@@ -1,309 +1,321 @@
 """
-Invigilator plans: assign invigilators to exam rooms (parallel to seating plans for students).
+Invigilator Plans API
+Allows admins and investigators to assign invigilators to exam rooms
+and lets the video-upload page verify that an assignment exists before
+accepting a video.
+
+Endpoints
+---------
+GET  /invigilator-plans                          – paginated list of all exams as plans
+GET  /invigilator-plans/assignment-check         – check if a room has an invigilator
+GET  /invigilator-plans/{exam_id}                – detailed plan (rooms + assignments) for one exam
+POST /invigilator-plans/{exam_id}/assign         – assign an invigilator to a room
+DELETE /invigilator-plans/assignments/{id}        – remove an assignment
 """
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.orm import Session
-from uuid import UUID
-from datetime import datetime, date as date_class
+
+from datetime import date, datetime
 from typing import List, Optional
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
-from database.db import get_db
-from database.models import Room, Exam, Invigilator, ExamInvigilatorAssignment
 from database.auth import get_current_user
+from database.db import get_db
+from database.models import Exam, ExamRoomAssignment, Invigilator, Room
 
-router = APIRouter(prefix="/invigilator-plans", tags=["invigilator-plans"])
+router = APIRouter(prefix="/invigilator-plans", tags=["Invigilator Plans"])
 
 
-class InvigilatorAssignmentRead(BaseModel):
+# ─────────────────────────────────────────────
+# Schemas
+# ─────────────────────────────────────────────
+
+class AssignmentOut(BaseModel):
     assignment_id: str
     invigilator_id: str
     name: str
     email: Optional[str] = None
-    is_primary: bool
+    is_primary: bool = True
 
 
-class RoomInvigilatorInfo(BaseModel):
+class RoomRowOut(BaseModel):
     room_id: str
     room_name: str
-    assignments: List[InvigilatorAssignmentRead]
+    assignments: List[AssignmentOut]
 
 
-class InvigilatorPlanRead(BaseModel):
+class PlanOut(BaseModel):
     id: str
     course: str
-    exam_date: Optional[datetime] = None
+    exam_date: Optional[str] = None
     start_time: Optional[str] = None
-    uploaded_at: datetime
+    uploaded_at: str
     status: str
-    rooms: List[RoomInvigilatorInfo]
+    rooms: Optional[List[RoomRowOut]] = None
 
 
-class InvigilatorPlanListResponse(BaseModel):
-    plans: List[InvigilatorPlanRead]
-    total: int
-    page: int
-    limit: int
+class AssignBody(BaseModel):
+    room_id: str
+    invigilator_id: str
 
 
-class AssignInvigilatorBody(BaseModel):
-    room_id: UUID
-    invigilator_id: UUID
-
-
-class RoomAssignmentStatus(BaseModel):
+class AssignmentCheckOut(BaseModel):
     assigned: bool
     invigilator_name: Optional[str] = None
     message: Optional[str] = None
 
 
-def _room_display_name(room: Room) -> str:
-    if room.block:
-        return f"{room.block}-{room.room_number}"
-    return str(room.room_number)
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+
+def _exam_status(exam: Exam) -> str:
+    today = date.today()
+    exam_date = exam.exam_date if isinstance(exam.exam_date, date) else None
+    if exam_date and exam_date < today:
+        return "completed"
+    return "processing"
 
 
-@router.get("/", response_model=InvigilatorPlanListResponse)
-def list_invigilator_plans(
-    page: int = Query(1, ge=1),
-    limit: int = Query(20, ge=1, le=100),
-    plan_status: Optional[str] = Query(None, alias="status", regex="^(completed|processing)$"),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    """Exams that have at least one room (same basis as seating plans)."""
-    if current_user.get("user_type") not in ("admin", "investigator"):
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    room_exam_ids = db.query(Room.exam_id).distinct().filter(Room.exam_id.isnot(None)).all()
-    exam_ids = [e[0] for e in room_exam_ids if e[0] is not None]
-    if not exam_ids:
-        return InvigilatorPlanListResponse(plans=[], total=0, page=page, limit=limit)
-
-    q = db.query(Exam).filter(Exam.exam_id.in_(exam_ids))
-    today = date_class.today()
-    if plan_status == "completed":
-        q = q.filter(Exam.exam_date < today)
-    elif plan_status == "processing":
-        q = q.filter(Exam.exam_date >= today)
-    exams = q.order_by(Exam.created_at.desc()).all()
-
-    all_rooms = db.query(Room).filter(Room.exam_id.in_([e.exam_id for e in exams])).all()
-    room_ids = [r.room_id for r in all_rooms]
-    all_assignments = []
-    if room_ids:
-        all_assignments = (
-            db.query(ExamInvigilatorAssignment)
-            .filter(ExamInvigilatorAssignment.room_id.in_(room_ids))
-            .all()
-        )
-
-    inv_ids = list({a.invigilator_id for a in all_assignments})
-    inv_by_id = {}
-    if inv_ids:
-        for inv in db.query(Invigilator).filter(Invigilator.invigilator_id.in_(inv_ids)).all():
-            inv_by_id[inv.invigilator_id] = inv
-
-    rooms_by_exam = {}
-    for r in all_rooms:
-        rooms_by_exam.setdefault(r.exam_id, []).append(r)
-
-    assign_by_room = {}
-    for a in all_assignments:
-        assign_by_room.setdefault(a.room_id, []).append(a)
-
-    plans: List[InvigilatorPlanRead] = []
-    for exam in exams:
-        rooms_out: List[RoomInvigilatorInfo] = []
-        for room in rooms_by_exam.get(exam.exam_id, []):
-            assigns = assign_by_room.get(room.room_id, [])
-            reads: List[InvigilatorAssignmentRead] = []
-            for asn in assigns:
-                inv = inv_by_id.get(asn.invigilator_id)
-                reads.append(
-                    InvigilatorAssignmentRead(
-                        assignment_id=str(asn.assignment_id),
-                        invigilator_id=str(asn.invigilator_id),
-                        name=inv.name if inv else "Unknown",
-                        email=inv.email if inv else None,
-                        is_primary=bool(asn.is_primary),
+def _build_plan(exam: Exam, db: Session, include_rooms: bool = False) -> PlanOut:
+    rooms_out: Optional[List[RoomRowOut]] = None
+    if include_rooms:
+        rooms = db.query(Room).filter(Room.exam_id == exam.exam_id).all()
+        rooms_out = []
+        for room in rooms:
+            assignments = (
+                db.query(ExamRoomAssignment)
+                .filter(
+                    ExamRoomAssignment.exam_id == exam.exam_id,
+                    ExamRoomAssignment.room_id == room.room_id,
+                )
+                .all()
+            )
+            a_out = []
+            for a in assignments:
+                inv: Optional[Invigilator] = db.query(Invigilator).filter(
+                    Invigilator.invigilator_id == a.invigilator_id
+                ).first()
+                if inv:
+                    a_out.append(
+                        AssignmentOut(
+                            assignment_id=str(a.assignment_id),
+                            invigilator_id=str(a.invigilator_id),
+                            name=inv.name,
+                            email=inv.email,
+                            is_primary=True,
+                        )
                     )
-                )
+            room_label = (
+                f"{room.block}-{room.room_number}" if room.block else room.room_number
+            )
             rooms_out.append(
-                RoomInvigilatorInfo(
+                RoomRowOut(
                     room_id=str(room.room_id),
-                    room_name=_room_display_name(room),
-                    assignments=reads,
+                    room_name=room_label,
+                    assignments=a_out,
                 )
             )
-        st = "completed" if exam.exam_date and exam.exam_date < today else "processing"
-        plans.append(
-            InvigilatorPlanRead(
-                id=str(exam.exam_id),
-                course=exam.course,
-                exam_date=datetime.combine(exam.exam_date, datetime.min.time()) if exam.exam_date else None,
-                start_time=exam.start_time.isoformat() if exam.start_time else None,
-                uploaded_at=exam.created_at or datetime.utcnow(),
-                status=st,
-                rooms=rooms_out,
-            )
-        )
 
-    plans.sort(key=lambda x: x.uploaded_at or datetime(1970, 1, 1), reverse=True)
-    total = len(plans)
-    offset = (page - 1) * limit
-    return InvigilatorPlanListResponse(
-        plans=plans[offset : offset + limit],
-        total=total,
-        page=page,
-        limit=limit,
+    return PlanOut(
+        id=str(exam.exam_id),
+        course=exam.course,
+        exam_date=str(exam.exam_date) if exam.exam_date else None,
+        start_time=str(exam.start_time) if exam.start_time else None,
+        uploaded_at=exam.created_at.isoformat() if exam.created_at else datetime.utcnow().isoformat(),
+        status=_exam_status(exam),
+        rooms=rooms_out,
     )
 
 
-@router.get("/assignment-check", response_model=RoomAssignmentStatus)
-def check_room_invigilator_assignment(
-    exam_id: UUID = Query(..., description="Exam UUID"),
-    room_id: UUID = Query(..., description="Room UUID"),
+# ─────────────────────────────────────────────
+# Endpoints
+# ─────────────────────────────────────────────
+
+@router.get("/assignment-check", response_model=AssignmentCheckOut)
+def assignment_check(
+    exam_id: str = Query(...),
+    room_id: str = Query(...),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    """Whether this exam room has an invigilator assigned (required before upload/recording)."""
-    if current_user.get("user_type") not in ("admin", "investigator"):
-        raise HTTPException(status_code=403, detail="Access denied")
-    room = db.query(Room).filter(Room.room_id == room_id).first()
-    if not room:
-        return RoomAssignmentStatus(assigned=False, message="Room not found")
-    if room.exam_id != exam_id:
-        return RoomAssignmentStatus(
-            assigned=False,
-            message="This room does not belong to the selected exam",
+    """
+    Returns whether an invigilator is assigned to a specific room for this exam.
+    Used by the video upload page to gate the Upload button.
+    """
+    try:
+        exam_uuid = UUID(exam_id)
+        room_uuid = UUID(room_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid exam_id or room_id")
+
+    assignment = (
+        db.query(ExamRoomAssignment)
+        .filter(
+            ExamRoomAssignment.exam_id == exam_uuid,
+            ExamRoomAssignment.room_id == room_uuid,
         )
-    asn = (
-        db.query(ExamInvigilatorAssignment)
-        .filter(ExamInvigilatorAssignment.room_id == room_id)
         .first()
     )
-    if not asn:
-        return RoomAssignmentStatus(
+
+    if not assignment:
+        return AssignmentCheckOut(
             assigned=False,
-            message="Assign an invigilator to this room in Invigilator Plans before uploading or recording exam footage.",
+            message="No invigilator assigned to this room. Assign one in Invigilator Plans.",
         )
-    inv = db.query(Invigilator).filter(Invigilator.invigilator_id == asn.invigilator_id).first()
-    return RoomAssignmentStatus(
+
+    inv: Optional[Invigilator] = db.query(Invigilator).filter(
+        Invigilator.invigilator_id == assignment.invigilator_id
+    ).first()
+
+    return AssignmentCheckOut(
         assigned=True,
         invigilator_name=inv.name if inv else None,
         message=None,
     )
 
 
-@router.get("/{exam_id}", response_model=InvigilatorPlanRead)
-def get_invigilator_plan(
-    exam_id: UUID,
+@router.get("", response_model=dict)
+def list_plans(
+    status: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=200),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Return all exams as invigilator plans (with room-level assignment summary).
+    """
+    query = db.query(Exam)
+    total = query.count()
+
+    exams = query.order_by(Exam.exam_date.desc()).offset((page - 1) * limit).limit(limit).all()
+
+    today = date.today()
+    plans = []
+    for exam in exams:
+        p = _build_plan(exam, db, include_rooms=True)
+        if status and p.status != status:
+            continue
+        plans.append(p.model_dump())
+
+    return {
+        "plans": plans,
+        "total": total,
+        "page": page,
+        "limit": limit,
+    }
+
+
+@router.get("/{exam_id}", response_model=PlanOut)
+def get_plan(
+    exam_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return detailed plan (rooms + assignments) for a single exam."""
+    try:
+        exam_uuid = UUID(exam_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid exam_id")
+
+    exam = db.query(Exam).filter(Exam.exam_id == exam_uuid).first()
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    return _build_plan(exam, db, include_rooms=True)
+
+
+@router.post("/{exam_id}/assign", response_model=AssignmentOut)
+def assign_invigilator(
+    exam_id: str,
+    body: AssignBody,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Assign an invigilator to a room for this exam (admin only)."""
     if current_user.get("user_type") not in ("admin", "investigator"):
-        raise HTTPException(status_code=403, detail="Access denied")
-    exam = db.query(Exam).filter(Exam.exam_id == exam_id).first()
+        raise HTTPException(status_code=403, detail="Only admins and investigators can assign invigilators")
+
+    try:
+        exam_uuid = UUID(exam_id)
+        room_uuid = UUID(body.room_id)
+        inv_uuid = UUID(body.invigilator_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid UUID in request")
+
+    exam = db.query(Exam).filter(Exam.exam_id == exam_uuid).first()
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
-    rooms = db.query(Room).filter(Room.exam_id == exam_id).all()
-    room_ids = [r.room_id for r in rooms]
-    assigns = []
-    if room_ids:
-        assigns = (
-            db.query(ExamInvigilatorAssignment)
-            .filter(ExamInvigilatorAssignment.room_id.in_(room_ids))
-            .all()
-        )
-    inv_ids = list({a.invigilator_id for a in assigns})
-    inv_by_id = {}
-    if inv_ids:
-        for inv in db.query(Invigilator).filter(Invigilator.invigilator_id.in_(inv_ids)).all():
-            inv_by_id[inv.invigilator_id] = inv
-    assign_by_room = {}
-    for a in assigns:
-        assign_by_room.setdefault(a.room_id, []).append(a)
-    today = date_class.today()
-    st = "completed" if exam.exam_date and exam.exam_date < today else "processing"
-    rooms_out = []
-    for room in rooms:
-        reads = []
-        for asn in assign_by_room.get(room.room_id, []):
-            inv = inv_by_id.get(asn.invigilator_id)
-            reads.append(
-                InvigilatorAssignmentRead(
-                    assignment_id=str(asn.assignment_id),
-                    invigilator_id=str(asn.invigilator_id),
-                    name=inv.name if inv else "Unknown",
-                    email=inv.email if inv else None,
-                    is_primary=bool(asn.is_primary),
-                )
-            )
-        rooms_out.append(
-            RoomInvigilatorInfo(
-                room_id=str(room.room_id),
-                room_name=_room_display_name(room),
-                assignments=reads,
-            )
-        )
-    return InvigilatorPlanRead(
-        id=str(exam.exam_id),
-        course=exam.course,
-        exam_date=datetime.combine(exam.exam_date, datetime.min.time()) if exam.exam_date else None,
-        start_time=exam.start_time.isoformat() if exam.start_time else None,
-        uploaded_at=exam.created_at or datetime.utcnow(),
-        status=st,
-        rooms=rooms_out,
-    )
 
-
-@router.post("/{exam_id}/assign", response_model=InvigilatorPlanRead)
-def assign_invigilator_to_room(
-    exam_id: UUID,
-    body: AssignInvigilatorBody,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    if current_user.get("user_type") != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can assign invigilators")
-    exam = db.query(Exam).filter(Exam.exam_id == exam_id).first()
-    if not exam:
-        raise HTTPException(status_code=404, detail="Exam not found")
-    room = db.query(Room).filter(Room.room_id == body.room_id, Room.exam_id == exam_id).first()
+    room = db.query(Room).filter(Room.room_id == room_uuid, Room.exam_id == exam_uuid).first()
     if not room:
         raise HTTPException(status_code=404, detail="Room not found for this exam")
-    inv = db.query(Invigilator).filter(Invigilator.invigilator_id == body.invigilator_id).first()
+
+    inv = db.query(Invigilator).filter(Invigilator.invigilator_id == inv_uuid).first()
     if not inv:
         raise HTTPException(status_code=404, detail="Invigilator not found")
-    # Exactly one invigilator per room: replace any existing assignment
-    db.query(ExamInvigilatorAssignment).filter(
-        ExamInvigilatorAssignment.room_id == body.room_id
-    ).delete(synchronize_session=False)
-    row = ExamInvigilatorAssignment(
-        exam_id=exam_id,
-        room_id=body.room_id,
-        invigilator_id=body.invigilator_id,
+
+    existing = (
+        db.query(ExamRoomAssignment)
+        .filter(
+            ExamRoomAssignment.exam_id == exam_uuid,
+            ExamRoomAssignment.room_id == room_uuid,
+            ExamRoomAssignment.invigilator_id == inv_uuid,
+        )
+        .first()
+    )
+    if existing:
+        return AssignmentOut(
+            assignment_id=str(existing.assignment_id),
+            invigilator_id=str(existing.invigilator_id),
+            name=inv.name,
+            email=inv.email,
+            is_primary=True,
+        )
+
+    new_assignment = ExamRoomAssignment(
+        exam_id=exam_uuid,
+        room_id=room_uuid,
+        invigilator_id=inv_uuid,
+        created_at=datetime.utcnow(),
+    )
+    db.add(new_assignment)
+    db.commit()
+    db.refresh(new_assignment)
+
+    return AssignmentOut(
+        assignment_id=str(new_assignment.assignment_id),
+        invigilator_id=str(new_assignment.invigilator_id),
+        name=inv.name,
+        email=inv.email,
         is_primary=True,
     )
-    db.add(row)
-    db.commit()
-    return get_invigilator_plan(exam_id, db, current_user)
 
 
-@router.delete("/assignments/{assignment_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/assignments/{assignment_id}", status_code=204)
 def remove_assignment(
-    assignment_id: UUID,
+    assignment_id: str,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    if current_user.get("user_type") != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can remove assignments")
-    row = db.query(ExamInvigilatorAssignment).filter(
-        ExamInvigilatorAssignment.assignment_id == assignment_id
+    """Remove a specific invigilator assignment (admin only)."""
+    if current_user.get("user_type") not in ("admin", "investigator"):
+        raise HTTPException(status_code=403, detail="Only admins and investigators can remove assignments")
+
+    try:
+        asgn_uuid = UUID(assignment_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid assignment_id")
+
+    assignment = db.query(ExamRoomAssignment).filter(
+        ExamRoomAssignment.assignment_id == asgn_uuid
     ).first()
-    if not row:
+    if not assignment:
         raise HTTPException(status_code=404, detail="Assignment not found")
-    db.delete(row)
+
+    db.delete(assignment)
     db.commit()
     return None

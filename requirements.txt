@@ -14,3 +14,7 @@ reportlab==4.2.5
 SQLAlchemy==2.0.44
 starlette==0.48.0
 uvicorn
+# Invigilator pose: Windows wheels 0.10.30+ use Tasks API (PoseLandmarker); legacy
+# `mediapipe.solutions` is absent — code falls back to Tasks + downloads .task model once.
+mediapipe>=0.10.9
+ultralytics>=8.3.0

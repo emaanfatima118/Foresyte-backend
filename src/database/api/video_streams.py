@@ -13,9 +13,15 @@ from pydantic import BaseModel, Field
 from uuid import UUID, uuid4
 import os
 import logging
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env before reading any environment variables
+load_dotenv()
 
 from database.db import get_db
-from database.models import VideoStream, ProcessingJob, FrameLog, Exam, Room, ExamInvigilatorAssignment
+from database.models import VideoStream, ProcessingJob, FrameLog, Exam, Room, StudentActivity, Violation, InvigilatorActivity, Invigilator
+from database.auth import get_current_user
 from app.video_processing.processor import VideoProcessor
 
 # Setup logging
@@ -27,8 +33,12 @@ router = APIRouter(
     tags=["video-streams"]
 )
 
-# Configuration
-USE_DATABASE = os.getenv("USE_DATABASE", "false").lower() == "true"
+# Configuration — evaluated after load_dotenv() above
+def _use_database() -> bool:
+    return os.getenv("USE_DATABASE", "false").lower() == "true"
+
+# Module-level constant (safe now that load_dotenv ran first)
+USE_DATABASE = _use_database()
 MAX_FILE_SIZE = 20 * 1024 * 1024 * 1024  # 20 GB
 ALLOWED_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
 
@@ -175,7 +185,8 @@ async def upload_exam_footage(
     video_file: UploadFile = File(...),
     exam_id: str = Form(...),
     room_id: str = Form(...),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Upload exam recording for processing (Frontend Integration Ready)
@@ -194,59 +205,65 @@ async def upload_exam_footage(
     ```
     """
     try:
-        # Validate UUIDs first (before reading a large file)
+        # Validate UUIDs first (cheap check before doing any I/O)
         try:
             exam_uuid = UUID(exam_id)
             room_uuid = UUID(room_id)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid exam_id or room_id format")
 
-        if USE_DATABASE and db:
-            exam = db.query(Exam).filter(Exam.exam_id == exam_uuid).first()
-            room = db.query(Room).filter(Room.room_id == room_uuid).first()
-            if not exam:
-                raise HTTPException(status_code=404, detail="Exam not found")
-            if not room:
-                raise HTTPException(status_code=404, detail="Room not found")
-            if room.exam_id != exam_uuid:
-                raise HTTPException(status_code=400, detail="Room does not belong to this exam")
-            asn = (
-                db.query(ExamInvigilatorAssignment)
-                .filter(ExamInvigilatorAssignment.room_id == room_uuid)
-                .first()
+        # Validate file extension before streaming
+        ext = os.path.splitext(video_file.filename or "")[1].lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid file format. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
             )
-            if not asn:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Assign an invigilator to this exam room in Invigilator Plans before uploading video.",
-                )
 
-        # Read file content
-        file_content = await video_file.read()
-        file_size = len(file_content)
-
-        # Validate file
-        is_valid, message = validate_video_file(video_file.filename, file_size)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=message)
-
-        # Generate stream ID
+        # Stream the file to disk in 8 MB chunks — avoids loading the whole video into RAM
+        CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB
         stream_id = uuid4()
-        
-        # Save video to disk
-        processor = VideoProcessor(db if USE_DATABASE else None, enable_ai=False)
-        video_path = processor.stream_handler.save_uploaded_video(
-            file_content, video_file.filename, str(exam_uuid), str(room_uuid)
-        )
-        
-        logger.info(f"Video uploaded: {video_path}")
-        logger.info(f"USE_DATABASE setting: {USE_DATABASE}")
-        
-        # Create database record if database available
+
+        upload_dir = Path("uploads/videos").resolve() / str(exam_uuid) / str(room_uuid)
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        new_filename = f"exam_footage_{timestamp}{ext}"
+        file_path = upload_dir / new_filename
+
+        file_size = 0
+        with open(file_path, "wb") as out:
+            while True:
+                chunk = await video_file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                out.write(chunk)
+                file_size += len(chunk)
+
+        # Size guard (applied after streaming so we don't need to buffer everything)
+        if file_size > MAX_FILE_SIZE:
+            file_path.unlink(missing_ok=True)
+            file_size_gb = file_size / (1024 ** 3)
+            raise HTTPException(
+                status_code=400,
+                detail=f"File too large ({file_size_gb:.2f} GB). Maximum: {MAX_FILE_SIZE // (1024**3)} GB"
+            )
+
+        video_path = str(file_path.resolve())
+        logger.info(f"Video saved ({file_size / (1024**2):.1f} MB): {video_path}")
+
+        # Create database record
         if USE_DATABASE and db:
             logger.info("Attempting to save video stream to database...")
             try:
-                # Exam, room, and invigilator assignment were validated before upload
+                # Validate exam and room exist
+                exam = db.query(Exam).filter(Exam.exam_id == exam_uuid).first()
+                room = db.query(Room).filter(Room.room_id == room_uuid).first()
+                
+                if not exam:
+                    raise HTTPException(status_code=404, detail=f"Exam not found")
+                if not room:
+                    raise HTTPException(status_code=404, detail=f"Room not found")
+                
                 # Create video stream record
                 video_stream = VideoStream(
                     stream_id=stream_id,
@@ -261,18 +278,12 @@ async def upload_exam_footage(
                 db.commit()
                 db.refresh(video_stream)
                 
-                logger.info(f"✅ Database record created for stream: {stream_id}")
+                logger.info(f"Database record created for stream: {stream_id}")
             except SQLAlchemyError as e:
-                logger.error(f"❌ Database error: {e}")
+                logger.error(f"Database error saving stream record: {e}")
                 db.rollback()
-                # Continue without database
         else:
-            if not USE_DATABASE:
-                logger.warning("⚠️ USE_DATABASE=false - Video will NOT persist in database!")
-                logger.warning("⚠️ Video will disappear after server restart or page refresh!")
-                logger.warning("⚠️ Set USE_DATABASE=true in .env file for persistent storage")
-            elif not db:
-                logger.warning("⚠️ Database session not available - Video will NOT persist!")
+            logger.warning("USE_DATABASE=false — stream record will not persist after restart")
         
         # Start processing in background
         background_tasks.add_task(
@@ -406,69 +417,202 @@ def get_processing_status(stream_id: str, db: Session = Depends(get_db)):
 @router.get("/{stream_id}/results")
 async def get_processing_results(stream_id: str, db: Session = Depends(get_db)):
     """
-    Get complete processing results (Frontend Results Page)
-    
-    Frontend Usage:
-    ```javascript
-    const response = await fetch(`/api/video-streams/${streamId}/results`);
-    const results = await response.json();
-    
-    // Display: results.data.activities, results.data.violations, etc.
-    ```
+    Get complete processing results (Frontend Results Page).
+    When the in-memory processor cache is empty (e.g. after a server restart) the
+    endpoint reconstructs results from the database so the page is never broken.
     """
     try:
         stream_uuid = UUID(stream_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid stream_id format")
-    
-    # Get from processor
-    processor = VideoProcessor(db if USE_DATABASE else None, enable_ai=False)
+
+    # --- DB-backed results (primary path when USE_DATABASE=true) ---
+    if USE_DATABASE and db:
+        try:
+            stream = db.query(VideoStream).filter(VideoStream.stream_id == stream_uuid).first()
+            if not stream:
+                raise HTTPException(status_code=404, detail="Video stream not found")
+
+            if stream.status not in ("completed", "failed"):
+                raise HTTPException(
+                    status_code=202,
+                    detail=f"Video is still {stream.status}. Poll /status and retry when completed."
+                )
+
+            # Load student activities and violations for this stream's exam
+            activities_raw = (
+                db.query(StudentActivity)
+                .filter(StudentActivity.exam_id == stream.exam_id)
+                .order_by(StudentActivity.timestamp)
+                .all()
+            )
+            violations_raw = (
+                db.query(Violation)
+                .filter(
+                    Violation.activity_id.in_([a.activity_id for a in activities_raw])
+                )
+                .all()
+            )
+
+            activities = [
+                {
+                    "timestamp": serialize_datetime(a.timestamp),
+                    "behavior_type": a.activity_type,
+                    "severity": a.severity,
+                    "confidence": float(a.confidence) if a.confidence is not None else None,
+                    "evidence_url": a.evidence_url,
+                    "actor_type": "student",
+                    "student_id": str(a.student_id) if a.student_id else None,
+                }
+                for a in activities_raw
+            ]
+
+            violations = [
+                {
+                    "violation_type": v.violation_type,
+                    "severity_level": v.severity,
+                    "status": v.status,
+                    "timestamp": serialize_datetime(v.timestamp),
+                    "evidence_url": v.evidence_url,
+                }
+                for v in violations_raw
+            ]
+
+            # Load invigilator activities for this stream's room within the processing window
+            invig_q = db.query(InvigilatorActivity).filter(
+                InvigilatorActivity.room_id == stream.room_id
+            )
+            if stream.started_at:
+                invig_q = invig_q.filter(InvigilatorActivity.timestamp >= stream.started_at)
+            if stream.completed_at:
+                invig_q = invig_q.filter(InvigilatorActivity.timestamp <= stream.completed_at)
+            invig_activities_raw = invig_q.order_by(InvigilatorActivity.timestamp).all()
+
+            # Batch-load invigilator names
+            invig_ids = {r.invigilator_id for r in invig_activities_raw if r.invigilator_id}
+            invigs_map = {
+                i.invigilator_id: i
+                for i in db.query(Invigilator).filter(
+                    Invigilator.invigilator_id.in_(invig_ids)
+                ).all()
+            } if invig_ids else {}
+
+            invigilator_activities = [
+                {
+                    "activity_id": str(ia.activity_id),
+                    "timestamp": serialize_datetime(ia.timestamp),
+                    "behavior_type": ia.activity_type,
+                    "severity": ia.severity,
+                    "confidence": float(ia.confidence) if ia.confidence is not None else None,
+                    "evidence_url": ia.evidence_url,
+                    "frame_number": ia.frame_number,
+                    "notes": ia.notes,
+                    "actor_type": "invigilator",
+                    "invigilator_id": str(ia.invigilator_id) if ia.invigilator_id else None,
+                    "invigilator_name": invigs_map[ia.invigilator_id].name
+                        if ia.invigilator_id and ia.invigilator_id in invigs_map else None,
+                }
+                for ia in invig_activities_raw
+            ]
+
+            job = (
+                db.query(ProcessingJob)
+                .filter(ProcessingJob.stream_id == stream_uuid)
+                .order_by(ProcessingJob.created_at.desc())
+                .first()
+            )
+
+            return {
+                "success": True,
+                "data": {
+                    "stream_id": stream_id,
+                    "status": stream.status,
+                    "exam_id": str(stream.exam_id),
+                    "room_id": str(stream.room_id),
+                    "processing_summary": {
+                        "started_at": serialize_datetime(stream.started_at),
+                        "completed_at": serialize_datetime(stream.completed_at),
+                        "total_frames": job.total_frames if job else 0,
+                        "stream_type": stream.stream_type,
+                    },
+                    "activities_summary": {
+                        "total_activities": len(activities) + len(invigilator_activities),
+                        "student_activities": len(activities),
+                        "invigilator_issues": len(invigilator_activities),
+                    },
+                    "violations_summary": {
+                        "total_violations": len(violations),
+                        "high_severity": len([v for v in violations if (v.get("severity_level") or 0) >= 3]),
+                        "pending_review": len([v for v in violations if v.get("status") == "pending"]),
+                    },
+                    "activities": activities,
+                    "violations": violations,
+                    "invigilator_activities": invigilator_activities,
+                    "frame_analysis": [],
+                },
+            }
+        except HTTPException:
+            raise
+        except SQLAlchemyError as e:
+            logger.error(f"DB error fetching results: {e}")
+            raise HTTPException(status_code=500, detail="Failed to fetch results from database")
+
+    # --- In-memory fallback (only useful if USE_DATABASE=false) ---
+    processor = VideoProcessor(None, enable_ai=False)
     results = processor.get_processing_results(stream_id)
-    
+
     if not results:
         raise HTTPException(
-            status_code=404, 
+            status_code=404,
             detail="Processing results not available. Video may still be processing or failed."
         )
-    
-    # Return frontend-friendly response
+
     return {
         "success": True,
         "data": {
             "stream_id": stream_id,
-            "status": "completed" if results.get('success') else "failed",
-            "exam_id": str(results.get('exam_id', '')),
-            "room_id": str(results.get('room_id', '')),
+            "status": "completed" if results.get("success") else "failed",
+            "exam_id": str(results.get("exam_id", "")),
+            "room_id": str(results.get("room_id", "")),
             "processing_summary": {
-                "started_at": results.get('started_at', ''),
-                "completed_at": results.get('completed_at', ''),
-                "total_frames": results.get('total_frames_processed', 0),
-                "stream_type": results.get('stream_type', 'recorded')
+                "started_at": results.get("started_at", ""),
+                "completed_at": results.get("completed_at", ""),
+                "total_frames": results.get("total_frames_processed", 0),
+                "stream_type": results.get("stream_type", "recorded"),
             },
             "activities_summary": {
-                "total_activities": len(results.get('activities_logged', [])),
-                "student_activities": len([a for a in results.get('activities_logged', []) 
-                                          if a.get('actor_type') == 'student']),
-                "invigilator_issues": len([a for a in results.get('activities_logged', []) 
-                                          if a.get('actor_type') == 'invigilator'])
+                "total_activities": len(results.get("activities_logged", [])),
+                "student_activities": len(
+                    [a for a in results.get("activities_logged", []) if a.get("actor_type") == "student"]
+                ),
+                "invigilator_issues": len(
+                    [a for a in results.get("activities_logged", []) if a.get("actor_type") == "invigilator"]
+                ),
             },
             "violations_summary": {
-                "total_violations": len(results.get('violations_detected', [])),
-                "high_severity": len([v for v in results.get('violations_detected', []) 
-                                     if v.get('severity_level', 0) >= 3]),
-                "pending_review": len([v for v in results.get('violations_detected', []) 
-                                      if v.get('status') == 'pending'])
+                "total_violations": len(results.get("violations_detected", [])),
+                "high_severity": len(
+                    [v for v in results.get("violations_detected", []) if v.get("severity_level", 0) >= 3]
+                ),
+                "pending_review": len(
+                    [v for v in results.get("violations_detected", []) if v.get("status") == "pending"]
+                ),
             },
-            "activities": results.get('activities_logged', []),
-            "violations": results.get('violations_detected', []),
+            "activities": [
+                a for a in results.get("activities_logged", []) if a.get("actor_type") == "student"
+            ],
+            "invigilator_activities": [
+                a for a in results.get("activities_logged", []) if a.get("actor_type") == "invigilator"
+            ],
+            "violations": results.get("violations_detected", []),
             "frame_analysis": [
                 {
                     **frame,
-                    "frame_url": convert_path_to_url(frame.get('frame_path', '')) if frame.get('frame_path') else None
+                    "frame_url": convert_path_to_url(frame.get("frame_path", "")) if frame.get("frame_path") else None,
                 }
-                for frame in results.get('frame_analysis', [])
-            ]
-        }
+                for frame in results.get("frame_analysis", [])
+            ],
+        },
     }
 
 

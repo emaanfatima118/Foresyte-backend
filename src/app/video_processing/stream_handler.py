@@ -11,7 +11,6 @@ import asyncio
 from pathlib import Path
 import logging
 import json
-import numpy as np
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -204,27 +203,6 @@ class VideoStreamHandler:
             logger.error(f"Error loading seat map: {str(e)}")
             return None
     
-    def _draw_seat_boxes(self, frame, seat_map: Dict[str, list]):
-        """
-        Draw green bounding boxes (polygons) on frame for each seat.
-        
-        Args:
-            frame: OpenCV frame (numpy array)
-            seat_map: Dictionary of seat_id -> polygon points
-        """
-        if not seat_map:
-            return
-        
-        for seat_id, polygon in seat_map.items():
-            if len(polygon) < 3:
-                continue
-            
-            # Convert to numpy array for OpenCV
-            pts = np.array(polygon, np.int32)
-            
-            # Draw green polygon outline
-            cv2.polylines(frame, [pts], True, (0, 255, 0), 2)
-    
     def extract_frames(self, video_source: str, frame_rate: int = 1, 
                       job_id: str = None, progress_callback=None, 
                       room_id: Optional[str] = None, db_session=None) -> list:
@@ -237,8 +215,8 @@ class VideoStreamHandler:
             frame_rate: Extract 1 frame per N frames (default: 1 = every frame)
             job_id: Processing job identifier
             progress_callback: Callback function for progress updates
-            room_id: Room UUID to get seating plan (optional)
-            db_session: Database session to query room info (optional)
+            room_id: Unused for drawing (kept for API compatibility; seat polygons are not drawn on frames)
+            db_session: Unused for drawing (kept for API compatibility)
             
         Returns:
             List of extracted frame information
@@ -256,39 +234,6 @@ class VideoStreamHandler:
             logger.error(f"Cannot open video source: {video_source}")
             logger.error(f"Tried absolute path: {os.path.abspath(video_source)}")
             return frames_info
-        
-        # Get video dimensions for seat map scaling
-        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        # Load seat map if room_id is provided
-        seat_map = None
-        if room_id and db_session:
-            try:
-                from database.models import Room
-                from uuid import UUID
-                
-                room = db_session.query(Room).filter(Room.room_id == UUID(room_id)).first()
-                if room:
-                    # Construct room number from block and room_number
-                    room_no = f"{room.block}-{room.room_number}" if room.block else room.room_number
-                    logger.info(f"Loading seat map for room: {room_no}")
-                    
-                    seat_map_path = self._get_room_paths(room_no)
-                    if seat_map_path:
-                        seat_map = self._load_seat_map(seat_map_path, frame_width, frame_height)
-                        if seat_map:
-                            logger.info(f"Successfully loaded seat map with {len(seat_map)} seats")
-                        else:
-                            logger.warning("Failed to load seat map data")
-                    else:
-                        logger.warning(f"Seat map file not found for room {room_no}")
-                else:
-                    logger.warning(f"Room not found in database for room_id: {room_id}")
-            except Exception as e:
-                logger.error(f"Error loading seat map: {str(e)}")
-                import traceback
-                traceback.print_exc()
         
         frame_number = 0
         extracted_count = 0
@@ -311,23 +256,15 @@ class VideoStreamHandler:
                     timestamp = datetime.utcnow()
                     frame_filename = f"frame_{job_id}_{frame_number}_{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
                     frame_path = self.frame_dir / frame_filename
-                    
-                    # Draw seat bounding boxes if seat map is available
-                    if seat_map:
-                        frame_copy = frame.copy()
-                        self._draw_seat_boxes(frame_copy, seat_map)
-                        # Save annotated frame
-                        cv2.imwrite(str(frame_path), frame_copy)
-                    else:
-                        # Save frame without annotations
-                        cv2.imwrite(str(frame_path), frame)
+                    # Raw CCTV only — no seating-plan overlay (cleaner input for cheating detection)
+                    cv2.imwrite(str(frame_path), frame)
                     
                     frames_info.append({
                         "frame_number": frame_number,
                         "timestamp": timestamp,
                         "frame_path": str(frame_path),
                         "extracted": True,
-                        "annotated": seat_map is not None
+                        "annotated": False,
                     })
                     
                     extracted_count += 1
@@ -490,7 +427,6 @@ class VideoStreamHandler:
             "total_frames": total_frames,
             "extracted_frames": len(frames),
             "fps": fps,
-            "frame_extraction_rate": frame_extraction_rate,
             "duration": validation['duration'],
             "frames_info": frames,
             "seat_map": seat_map,

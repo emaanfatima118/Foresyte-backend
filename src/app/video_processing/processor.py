@@ -9,7 +9,10 @@ from collections import defaultdict
 import json
 import asyncio
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from functools import partial
 
 import cv2
 
@@ -19,10 +22,6 @@ from database.severity_logic import (
     filter_qualifying_runs,
     compute_severity_from_count,
     severity_to_int,
-    get_runs_from_invigilator_detections,
-    filter_qualifying_invigilator_runs,
-    estimate_invigilator_run_duration_seconds,
-    invigilator_activity_category_and_severity,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -61,10 +60,13 @@ class VideoProcessor:
                 from app.ai_engine.detection_adapter import process_frame, map_detection_to_seat
                 self.process_frame = process_frame
                 self.map_detection_to_seat = map_detection_to_seat
-                self.behavior_detector = True  # Flag that AI is available
+                self.behavior_detector = True  # Flag that student cheating AI is available
             except ImportError as e:
-                logger.warning("AI engine module not found. AI detection disabled. %s", e)
-                self.enable_ai = False
+                logger.warning(
+                    "Student cheating AI (detection_adapter) not available — student detection disabled. %s",
+                    e,
+                )
+                # Do not set enable_ai=False: invigilator detection is independent and must still run.
                 self.process_frame = None
                 self.map_detection_to_seat = None
                 self.behavior_detector = None
@@ -75,8 +77,14 @@ class VideoProcessor:
         self.db_session = db_session
         self.processing_results = {}
         self.progress_callback = None  # Callback to update progress during processing
-        self._invigilator_prev_center = None
 
+        # Invigilator detection adapter (one instance per stream; initialized lazily)
+        self.invig_adapter = None
+
+        # Set during process_video_stream so DB helpers can access them
+        self._current_exam_id: Optional[str] = None
+        self._current_room_id: Optional[str] = None
+        
     def set_progress_callback(self, callback):
         """Set callback function to update progress during frame extraction"""
         self.progress_callback = callback
@@ -100,7 +108,34 @@ class VideoProcessor:
         """
         logger.info(f"Starting video processing for stream {stream_id}")
         start_time = datetime.utcnow()
-        self._invigilator_prev_center = None
+
+        # Store context for DB helpers
+        self._current_exam_id = exam_id
+        self._current_room_id = room_id
+
+        # Invigilator detection is independent of student cheating AI — always load when not disabled.
+        self.invig_adapter = None
+        _disable_inv = os.getenv("DISABLE_INVIGILATOR_DETECTION", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        if not _disable_inv:
+            try:
+                from app.invigilator.invig_adapter import InvigFrameAdapter
+                self.invig_adapter = InvigFrameAdapter()
+                logger.info("Invigilator detection adapter initialized for stream %s", stream_id)
+            except FileNotFoundError as e:
+                logger.warning(
+                    "Invigilator model not found — invigilator activities will not be detected: %s",
+                    e,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Invigilator detection adapter failed to load — invigilator activities disabled: %s",
+                    e,
+                    exc_info=True,
+                )
+        else:
+            logger.info("Invigilator detection skipped (DISABLE_INVIGILATOR_DETECTION is set)")
 
         try:
             # Step 1: Connect to video source
@@ -186,30 +221,37 @@ class VideoProcessor:
         violations = []
         frame_count = 0
         detections_by_student_live: Dict[str, List[Dict]] = defaultdict(list)
-        detections_invigilator_live: List[Dict] = []
 
         async def frame_callback(frame, frame_num, timestamp):
             """Process each frame: collect detections per student for run-based logic."""
             nonlocal frame_count
 
-            if self.enable_ai and self.process_frame:
+            if self.process_frame:
                 analysis = self.process_frame(
-                    frame,
-                    frame_num,
-                    timestamp,
-                    seat_mapping,
-                    invigilator_prev_center=self._invigilator_prev_center,
+                    frame, frame_num, timestamp, seat_mapping
                 )
-                self._invigilator_prev_center = analysis.get("invigilator_next_center")
                 student_behaviors = analysis.get('student_behaviors', [])
-                invigilator_behaviors = analysis.get('invigilator_behaviors', [])
             else:
-                logger.info(f"Frame {frame_num} captured (AI detection disabled)")
                 student_behaviors = []
+
+            # Invigilator runs whenever the adapter is loaded (independent of student AI)
+            if self.invig_adapter is not None:
+                try:
+                    invigilator_behaviors = self.invig_adapter.process_frame(
+                        frame, frame_num, timestamp
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Invigilator detection failed on live frame %d: %s",
+                        frame_num,
+                        exc,
+                    )
+                    invigilator_behaviors = []
+            else:
                 invigilator_behaviors = []
 
             for behavior in student_behaviors:
-                seat_id = self.map_detection_to_seat(behavior, seat_mapping) if (self.enable_ai and self.map_detection_to_seat) else None
+                seat_id = self.map_detection_to_seat(behavior, seat_mapping) if (self.process_frame and self.map_detection_to_seat) else None
                 student_id = (behavior.get('student_id') or (seat_id if isinstance(seat_id, str) else None))
                 detection = {
                     "timestamp": timestamp.isoformat(),
@@ -226,15 +268,20 @@ class VideoProcessor:
                 detections_by_student_live[key].append(detection)
 
             for behavior in invigilator_behaviors:
-                detections_invigilator_live.append({
+                activity = {
                     "timestamp": timestamp.isoformat(),
                     "frame_number": frame_num,
-                    "behavior_type": behavior["behavior_type"],
-                    "severity": behavior.get("severity", "low"),
-                    "confidence": behavior.get("confidence"),
-                    "details": behavior.get("details", ""),
+                    "behavior_type": behavior['behavior_type'],
+                    "severity": behavior['severity'],
+                    "confidence": behavior['confidence'],
+                    "details": behavior.get('details', ''),
+                    "tracker_id": behavior.get('tracker_id'),
+                    "bbox": behavior.get('bbox'),
                     "actor_type": "invigilator",
-                })
+                }
+                activities.append(activity)
+                if self.db_session:
+                    await self._log_invigilator_activity_to_db(activity, room_id)
 
             frame_count += 1
             if frame_count % 100 == 0:
@@ -276,19 +323,6 @@ class VideoProcessor:
                         create_violation=True,
                     )
 
-        # Invigilator: log each qualifying run; violations only for sustained phone / out of classroom (time thresholds).
-        runs_inv = get_runs_from_invigilator_detections(detections_invigilator_live)
-        for run in filter_qualifying_invigilator_runs(runs_inv):
-            activity = self._invigilator_activity_from_run(
-                run,
-                source_mode="live",
-                video_fps=30.0,
-                frame_extraction_rate=30,
-            )
-            activities.append(activity)
-            if self.db_session:
-                await self._log_invigilator_activity_to_db(activity, exam_id, room_id)
-
         return {
             "stream_result": stream_result,
             "activities_logged": activities,
@@ -318,11 +352,9 @@ class VideoProcessor:
 
         # Collect detections per student (frame sequence) for run-based violation logic
         detections_by_student: Dict[str, List[Dict]] = defaultdict(list)
-        detections_invigilator: List[Dict] = []
         activities = []
         violations = []
         frame_analyses = []
-        self._invigilator_prev_center = None
         
         # Extract and process frames
         def progress_callback(processed, total):
@@ -335,11 +367,20 @@ class VideoProcessor:
                 except Exception as e:
                     logger.warning(f"Progress callback error: {e}")
         
-        # Step 3: Process video frames in batch mode
-        # Pass progress_callback, room_id, and db_session to stream_handler which will call it during frame extraction
-        extraction_result = self.stream_handler.process_recorded_video(
-            video_path, stream_id, progress_callback, 
-            room_id=room_id, db_session=self.db_session
+        # Step 3: Process video frames in batch mode.
+        # process_recorded_video is a blocking sync function (OpenCV + disk I/O).
+        # Run it in a thread-pool executor so it doesn't block the asyncio event loop.
+        loop = asyncio.get_event_loop()
+        extraction_result = await loop.run_in_executor(
+            None,
+            partial(
+                self.stream_handler.process_recorded_video,
+                video_path,
+                stream_id,
+                progress_callback,
+                room_id=room_id,
+                db_session=self.db_session,
+            ),
         )
         
         if not extraction_result['success']:
@@ -350,17 +391,6 @@ class VideoProcessor:
         
         frames_info = extraction_result['frames_info']
         total_frames_in_video = extraction_result.get('total_frames', len(frames_info))
-        _v_fps = float(extraction_result.get("fps") or 0)
-        _ex_rate_raw = extraction_result.get("frame_extraction_rate")
-        if _ex_rate_raw is not None:
-            inv_frame_extraction_rate = max(1, int(_ex_rate_raw))
-        elif len(frames_info) >= 2:
-            inv_frame_extraction_rate = max(
-                1,
-                int(frames_info[1]["frame_number"]) - int(frames_info[0]["frame_number"]),
-            )
-        else:
-            inv_frame_extraction_rate = max(1, int(_v_fps) if _v_fps else 30)
         logger.info(f"Extracted {len(frames_info)} frames for analysis (out of {total_frames_in_video} total frames in video)")
         
         # Build seat mapper for bbox -> student resolution (seating plan coordinates)
@@ -381,67 +411,96 @@ class VideoProcessor:
             )
             logger.info("Seat mapper initialized for student identification")
         
-        # Step 4: AI engine processes each frame
+        # Step 4: AI engine processes each frame.
+        # cv2.imread + model inference are blocking CPU/disk operations; run each in the
+        # thread-pool so we don't freeze the event loop between frames.
+        loop = asyncio.get_event_loop()
+
+        def _analyse_frame_sync(frame_info):
+            """Blocking helper: load frame, run student AI (optional), invigilator AI, save evidence."""
+            fp = frame_info["frame_path"]
+            fn = frame_info["frame_number"]
+            ts = frame_info["timestamp"]
+
+            import cv2 as _cv2
+            frame = _cv2.imread(fp)
+            if frame is None:
+                return None, fp, fn, ts
+
+            if self.process_frame:
+                analysis = self.process_frame(frame, fn, ts, return_annotated=True)
+            else:
+                analysis = {
+                    "student_behaviors": [],
+                    "invigilator_behaviors": [],
+                }
+
+            # Invigilator runs whenever the adapter is loaded (independent of student AI)
+            if self.invig_adapter is not None:
+                try:
+                    invig_behaviors = self.invig_adapter.process_frame(frame, fn, ts)
+                    analysis["invigilator_behaviors"] = invig_behaviors
+                except Exception as _invig_exc:
+                    logger.warning(
+                        "Invigilator detection failed on frame %d: %s",
+                        fn,
+                        _invig_exc,
+                        exc_info=True,
+                    )
+
+            evidence_url = _evidence_path_to_url(fp)
+            if analysis.get("annotated_frame") is not None:
+                ann_path = str(Path(fp).with_suffix("")) + "_detection.jpg"
+                _cv2.imwrite(ann_path, analysis["annotated_frame"])
+                fp = ann_path
+                try:
+                    from app.storage.b2_storage import upload_evidence_frame
+                    b2_url = upload_evidence_frame(ann_path)
+                    evidence_url = b2_url if b2_url else _evidence_path_to_url(ann_path)
+                except Exception as exc:
+                    logger.debug("B2 upload skipped or failed: %s", exc)
+                    evidence_url = _evidence_path_to_url(ann_path)
+
+            analysis["_evidence_url"] = evidence_url
+            analysis["_frame_path"] = fp
+            return analysis, fp, fn, ts
+
         for idx, frame_info in enumerate(frames_info):
             frame_path = frame_info['frame_path']
             frame_number = frame_info['frame_number']
             timestamp = frame_info['timestamp']
-            
-            if self.enable_ai and self.process_frame:
-                # Load frame
-                import cv2
-                frame = cv2.imread(frame_path)
-                
-                if frame is None:
-                    logger.warning(f"Failed to load frame: {frame_path}")
-                    continue
-                
-                # Analyze frame with cheating detection (request annotated for evidence)
-                analysis = self.process_frame(
-                    frame,
-                    frame_number,
-                    timestamp,
-                    return_annotated=True,
-                    invigilator_prev_center=self._invigilator_prev_center,
+
+            if self.process_frame or self.invig_adapter:
+                analysis, frame_path, frame_number, timestamp = await loop.run_in_executor(
+                    None, _analyse_frame_sync, frame_info
                 )
-                self._invigilator_prev_center = analysis.get("invigilator_next_center")
-                
-                # Default: use local path as evidence URL
-                evidence_url_preferred = _evidence_path_to_url(frame_path)
-                # Save annotated frame when suspicious activity detected (evidence)
-                if analysis.get("annotated_frame") is not None:
-                    ann_path = str(Path(frame_path).with_suffix("")) + "_detection.jpg"
-                    cv2.imwrite(ann_path, analysis["annotated_frame"])
-                    frame_path = ann_path  # Use annotated frame as evidence
-                    # Upload to Backblaze B2 when configured (preserves evidence in cloud)
-                    try:
-                        from app.storage.b2_storage import upload_evidence_frame
-                        b2_url = upload_evidence_frame(ann_path)
-                        evidence_url_preferred = b2_url if b2_url else _evidence_path_to_url(ann_path)
-                    except Exception as e:
-                        logger.debug("B2 upload skipped or failed: %s", e)
-                        evidence_url_preferred = _evidence_path_to_url(ann_path)
-                
+                if analysis is None:
+                    logger.warning(f"Failed to load frame: {frame_info['frame_path']}")
+                    continue
+
+                evidence_url_preferred = analysis.pop("_evidence_url", _evidence_path_to_url(frame_path))
+                analysis.pop("_frame_path", None)
+
                 frame_analyses.append({
                     "frame_number": frame_number,
-                    "timestamp": timestamp.isoformat(),
-                    "detections": len(analysis['student_behaviors']) + len(analysis['invigilator_behaviors'])
+                    "timestamp": timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp),
+                    "detections": len(analysis.get('student_behaviors', [])) + len(analysis.get('invigilator_behaviors', []))
                 })
-                
+
                 # Step 5 & 6: Process detections, map to seats, and log
                 student_behaviors = analysis.get('student_behaviors', [])
                 invigilator_behaviors = analysis.get('invigilator_behaviors', [])
             else:
-                # Skip AI detection - just log frame extraction
+                # No student AI and no invigilator adapter — only log frame extraction
                 frame_analyses.append({
                     "frame_number": frame_number,
-                    "timestamp": timestamp.isoformat(),
+                    "timestamp": timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp),
                     "frame_path": frame_path,
                     "detections": 0
                 })
                 student_behaviors = []
                 invigilator_behaviors = []
-                logger.info(f"Frame {frame_number} extracted (AI disabled)")
+                logger.info(f"Frame {frame_number} extracted (no AI: student and invigilator disabled)")
             
             # Process student behaviors: collect per student for frame-run logic (one violation per run)
             for behavior in student_behaviors:
@@ -468,23 +527,39 @@ class VideoProcessor:
                 key = str(student_id) if student_id else "unidentified"
                 detections_by_student[key].append(detection)
             
-            # Invigilator: accumulate per frame; one DB row per qualifying run (after loop)
+            # Process invigilator behaviors
             for behavior in invigilator_behaviors:
-                detections_invigilator.append({
+                activity = {
                     "timestamp": timestamp.isoformat(),
                     "frame_number": frame_number,
-                    "behavior_type": behavior["behavior_type"],
-                    "severity": behavior.get("severity", "low"),
-                    "confidence": behavior.get("confidence"),
-                    "details": behavior.get("details", ""),
+                    "behavior_type": behavior['behavior_type'],
+                    "severity": behavior['severity'],
+                    "confidence": behavior['confidence'],
+                    "details": behavior.get('details', ''),
+                    "tracker_id": behavior.get('tracker_id'),
+                    "bbox": behavior.get('bbox'),
                     "evidence_path": frame_path,
-                    "evidence_url": evidence_url_preferred,
+                    "evidence_url": evidence_url_preferred if (self.process_frame or self.invig_adapter) else _evidence_path_to_url(frame_path),
                     "actor_type": "invigilator",
-                })
-
+                }
+                activities.append(activity)
+                
+                if self.db_session:
+                    await self._log_invigilator_activity_to_db(activity, room_id)
+            
             # Progress logging
             if (idx + 1) % 10 == 0:
                 logger.info(f"Analyzed {idx + 1}/{len(frames_info)} frames")
+
+        invigilator_phase_count = sum(
+            1 for a in activities if a.get("actor_type") == "invigilator"
+        )
+        logger.info(
+            "Invigilator detection summary: adapter=%s, invigilator behaviours in batch=%d "
+            "(each should produce 'Logged invigilator activity … to DB' when USE_DATABASE is on)",
+            "active" if self.invig_adapter else "none",
+            invigilator_phase_count,
+        )
 
         # Run-based logic: one activity + one violation per qualifying run per student (no redundant per-frame)
         for student_key, det_list in detections_by_student.items():
@@ -520,18 +595,6 @@ class VideoProcessor:
                         activity, exam_id, room_id,
                         create_violation=True,
                     )
-
-        runs_inv_rec = get_runs_from_invigilator_detections(detections_invigilator)
-        for run in filter_qualifying_invigilator_runs(runs_inv_rec):
-            activity = self._invigilator_activity_from_run(
-                run,
-                source_mode="recorded",
-                video_fps=_v_fps,
-                frame_extraction_rate=inv_frame_extraction_rate,
-            )
-            activities.append(activity)
-            if self.db_session:
-                await self._log_invigilator_activity_to_db(activity, exam_id, room_id)
 
         return {
             "success": True,
@@ -630,116 +693,99 @@ class VideoProcessor:
             if self.db_session:
                 self.db_session.rollback()
     
-    def _invigilator_activity_from_run(
-        self,
-        run,
-        *,
-        source_mode: str,
-        video_fps: float,
-        frame_extraction_rate: int,
-    ) -> Dict[str, Any]:
-        """Build one invigilator activity dict from a label run (time-based violation policy)."""
-        fd = run.first_detection
-        duration = estimate_invigilator_run_duration_seconds(
-            run,
-            source_mode=source_mode,
-            video_fps=video_fps,
-            frame_extraction_rate=frame_extraction_rate,
-        )
-        cat, sev = invigilator_activity_category_and_severity(run.normalized_key, duration)
-        details_base = (fd.get("details") or "").strip()
-        dur_note = f"~{duration:.1f}s estimated duration ({run.frame_count} samples)"
-        details = (
-            f"{details_base}; {dur_note}" if details_base else dur_note
-        )
-        return {
-            "timestamp": fd.get("timestamp"),
-            "frame_number": fd.get("frame_number"),
-            "behavior_type": run.label_raw,
-            "severity": sev,
-            "confidence": fd.get("confidence"),
-            "details": details,
-            "evidence_path": fd.get("evidence_path"),
-            "evidence_url": fd.get("evidence_url"),
-            "actor_type": "invigilator",
-            "activity_category": cat,
-            "duration_seconds": duration,
-        }
-
-    async def _log_invigilator_activity_to_db(self, activity: Dict, exam_id: str, room_id: str):
+    async def _log_invigilator_activity_to_db(self, activity: Dict, room_id: str):
         """
-        Log invigilator activity to database, attributed to the single invigilator
-        assigned to this exam room (invigilator plan).
+        Step 6 of UC-07 (invigilator path): Store InvigilatorActivity in the database.
+
+        Resolves the invigilator identity via ExamRoomAssignment for the current
+        exam + room.  If no assignment exists the record is still saved with
+        invigilator_id=None so the alert is not silently lost.
         """
         if not self.db_session:
             return
-        from uuid import UUID
-        from database.models import ExamInvigilatorAssignment, InvigilatorActivity, Invigilator
-
-        logger.debug("Logging invigilator activity to DB: %s", activity.get("behavior_type"))
         try:
-            exam_uuid = UUID(str(exam_id).strip())
-            room_uuid = UUID(str(room_id).strip())
-        except (ValueError, TypeError):
-            logger.warning("Invalid exam_id or room_id for invigilator activity log")
-            return
+            from uuid import UUID
+            from database.models import InvigilatorActivity, ExamRoomAssignment
 
-        row = (
-            self.db_session.query(ExamInvigilatorAssignment)
-            .filter(
-                ExamInvigilatorAssignment.exam_id == exam_uuid,
-                ExamInvigilatorAssignment.room_id == room_uuid,
+            room_uuid = UUID(room_id)
+
+            # Resolve which invigilator is assigned to this room for the exam
+            invigilator_id = None
+            if self._current_exam_id:
+                try:
+                    assignment = (
+                        self.db_session.query(ExamRoomAssignment)
+                        .filter(
+                            ExamRoomAssignment.room_id == room_uuid,
+                            ExamRoomAssignment.exam_id == UUID(self._current_exam_id),
+                        )
+                        .first()
+                    )
+                    if assignment:
+                        invigilator_id = assignment.invigilator_id
+                        logger.debug(
+                            "Resolved invigilator %s for room %s / exam %s",
+                            invigilator_id, room_id, self._current_exam_id,
+                        )
+                    else:
+                        logger.debug(
+                            "No ExamRoomAssignment found for room %s / exam %s — "
+                            "saving invigilator activity without invigilator_id",
+                            room_id, self._current_exam_id,
+                        )
+                except Exception as lookup_err:
+                    logger.warning("Invigilator lookup failed: %s", lookup_err)
+
+            ts = activity.get("timestamp")
+            if isinstance(ts, str):
+                ts = (
+                    datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    if "T" in ts
+                    else datetime.fromisoformat(ts)
+                )
+            else:
+                ts = ts or datetime.utcnow()
+
+            raw_url = activity.get("evidence_url") or activity.get("evidence_path")
+            if raw_url and (
+                str(raw_url).startswith("http://") or str(raw_url).startswith("https://")
+            ):
+                evidence_url = raw_url
+            else:
+                evidence_url = _evidence_path_to_url(raw_url)
+
+            notes_parts = [activity.get("details", "")]
+            tracker_id = activity.get("tracker_id")
+            if tracker_id is not None:
+                notes_parts.append(f"tracker_id={tracker_id}")
+            bbox = activity.get("bbox")
+            if bbox:
+                notes_parts.append(f"bbox={bbox}")
+            notes = " | ".join(p for p in notes_parts if p)
+
+            inv_activity = InvigilatorActivity(
+                invigilator_id=invigilator_id,
+                room_id=room_uuid,
+                timestamp=ts,
+                activity_type=activity.get("behavior_type"),
+                severity=activity.get("severity"),
+                confidence=activity.get("confidence"),
+                frame_number=activity.get("frame_number"),
+                evidence_url=evidence_url,
+                notes=notes or None,
             )
-            .first()
-        )
-        if not row:
-            logger.warning(
-                "No invigilator plan for exam %s room %s — assign an invigilator in Invigilator Plans",
-                exam_id,
+            self.db_session.add(inv_activity)
+            self.db_session.commit()
+            logger.info(
+                "Logged invigilator activity [%s] to DB (invigilator=%s, room=%s)",
+                activity.get("behavior_type"),
+                invigilator_id or "unknown",
                 room_id,
             )
-            return
-
-        invigilator_id = row.invigilator_id
-        ts_raw = activity.get("timestamp")
-        if isinstance(ts_raw, datetime):
-            ts = ts_raw
-        elif isinstance(ts_raw, str):
-            try:
-                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-            except ValueError:
-                ts = datetime.utcnow()
-        else:
-            ts = datetime.utcnow()
-
-        sev = activity.get("severity")
-        if isinstance(sev, str):
-            sev = sev.strip().lower() if sev.strip() else None
-        cat = activity.get("activity_category") or "invigilation_activity"
-        if cat not in ("violation", "invigilation_activity"):
-            cat = "invigilation_activity"
-        dur = activity.get("duration_seconds")
-        try:
-            dur_f = float(dur) if dur is not None else None
-        except (TypeError, ValueError):
-            dur_f = None
-        rec = InvigilatorActivity(
-            invigilator_id=invigilator_id,
-            room_id=room_uuid,
-            activity_type=str(activity.get("behavior_type", "unknown")),
-            severity=sev if sev in ("low", "medium", "high", "critical") else None,
-            activity_category=cat,
-            duration_seconds=dur_f,
-            notes=(activity.get("details") or None),
-            timestamp=ts,
-        )
-        self.db_session.add(rec)
-        self.db_session.commit()
-        self.db_session.refresh(rec)
-        inv = self.db_session.query(Invigilator).filter(Invigilator.invigilator_id == invigilator_id).first()
-        if inv:
-            activity["invigilator_name"] = inv.name
-            activity["invigilator_id"] = str(invigilator_id)
+        except Exception as e:
+            logger.warning("Failed to log invigilator activity to DB: %s", e)
+            if self.db_session:
+                self.db_session.rollback()
     
     def get_processing_results(self, stream_id: str) -> Optional[Dict[str, Any]]:
         """

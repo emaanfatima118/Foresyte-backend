@@ -18,8 +18,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from math import hypot
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -51,6 +50,34 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# MODEL CACHE — load once per process, reuse on every request
+# ──────────────────────────────────────────────────────────────────────────────
+_PERSON_MODEL: Optional[YOLO] = None
+_CHEATING_MODEL: Optional[YOLO] = None
+_LOADED_PERSON_PATH: Optional[str] = None
+_LOADED_CHEATING_PATH: Optional[str] = None
+
+
+def _get_models(cfg: "Config") -> tuple[YOLO, YOLO]:
+    """
+    Return cached YOLO models, loading from disk only when the path changes
+    (e.g. first call, or if the .env is updated to point to a new model).
+    """
+    global _PERSON_MODEL, _CHEATING_MODEL, _LOADED_PERSON_PATH, _LOADED_CHEATING_PATH
+
+    if _PERSON_MODEL is None or _LOADED_PERSON_PATH != cfg.person_model_path:
+        log.info("Loading person model: %s", cfg.person_model_path)
+        _PERSON_MODEL = YOLO(cfg.person_model_path)
+        _LOADED_PERSON_PATH = cfg.person_model_path
+
+    if _CHEATING_MODEL is None or _LOADED_CHEATING_PATH != cfg.cheating_model_path:
+        log.info("Loading cheating model: %s", cfg.cheating_model_path)
+        _CHEATING_MODEL = YOLO(cfg.cheating_model_path)
+        _LOADED_CHEATING_PATH = cfg.cheating_model_path
+
+    return _PERSON_MODEL, _CHEATING_MODEL
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -76,7 +103,14 @@ class Config:
     cheat_run_conf: float = 0.01    # Keep low — we gather all raw scores manually
     min_crop_size: int = 200        # Upscale crops smaller than this (px)
     crop_pad_ratio: float = 0.15    # Context padding as fraction of bbox side
-    margin_over_normal: float = 0.08  # Suspicious score must beat Normal by this much
+
+    # A suspicious class must beat Normal score by at least this margin.
+    # 0.08 was far too lenient — the previous value let through many garbage flags.
+    margin_over_normal: float = 0.20
+
+    # If the model's single best score across ALL classes is below this, it has
+    # no real opinion on the crop → default to Normal rather than guessing.
+    min_decision_confidence: float = 0.25
 
     # Annotation
     cheating_box_thickness: int = 3
@@ -97,15 +131,16 @@ class Config:
     ])
 
     # Per-class minimum confidence to flag as suspicious.
-    # Tuned to reduce false positives while keeping recall high.
+    # Raised substantially from original values — the old thresholds caused most
+    # of the room to be marked as "phone" at 0.17–0.23 confidence.
     class_flag_thresholds: dict = field(default_factory=lambda: {
-        "phone":              0.12,
-        "Hand Under Table":   0.20,
-        "Bend Over The Desk": 0.12,
-        "Stand Up":           0.55,   # Very noisy — leaning looks like standing
-        "Wave":               0.15,
-        "Look Around":        0.18,
-        "Normal":             0.00,   # Not used for flagging
+        "phone":              0.40,   # was 0.12 — phone at <40% is just writing/posture noise
+        "Hand Under Table":   0.35,   # was 0.20
+        "Bend Over The Desk": 0.35,   # was 0.12
+        "Stand Up":           0.55,   # unchanged — leaning already looks like standing
+        "Wave":               0.35,   # was 0.15
+        "Look Around":        0.35,   # was 0.18
+        "Normal":             0.00,   # not used for flagging
     })
 
     @property
@@ -303,99 +338,6 @@ def filter_seated(detections: list[Detection], cfg: Config) -> tuple[list[Detect
     return seated, skipped
 
 
-def split_seated_standing(
-    detections: list[Detection], cfg: Config
-) -> tuple[list[Detection], list[Detection]]:
-    """Split person detections into seated (students) vs standing (typical invigilator)."""
-    seated, standing = [], []
-    for det in detections:
-        x1, y1, x2, y2 = det.bbox
-        bw = max(1, x2 - x1)
-        bh = y2 - y1
-        aspect = bh / bw
-        if aspect > cfg.standing_aspect_ratio:
-            standing.append(det)
-        else:
-            seated.append(det)
-    return seated, standing
-
-
-def _bbox_area(det: Detection) -> int:
-    x1, y1, x2, y2 = det.bbox
-    return max(0, x2 - x1) * max(0, y2 - y1)
-
-
-def _bbox_center_xy(bbox: tuple[int, int, int, int]) -> tuple[float, float]:
-    x1, y1, x2, y2 = bbox
-    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
-
-
-def compute_invigilator_behaviors_for_frame(
-    h: int,
-    w: int,
-    persons: list[Detection],
-    seated: list[Detection],
-    standing: list[Detection],
-    cheating_model: YOLO,
-    enhanced: np.ndarray,
-    cfg: Config,
-    prev_center: Optional[tuple[float, float]],
-) -> tuple[List[Dict[str, Any]], Optional[tuple[float, float]]]:
-    """
-    Emit canonical invigilator labels: out of classroom, sitting, standing, walking, phone.
-    Walking = large bbox movement vs previous frame (same person track proxy).
-    Phone = cheating classifier on standing invigilator crop flags phone.
-    """
-    behaviors: List[Dict[str, Any]] = []
-    motion_thresh = 0.035 * max(h, w)
-
-    if not persons:
-        behaviors.append({
-            "behavior_type": "out of classroom",
-            "severity": "low",
-            "confidence": 0.55,
-            "details": "no persons detected in frame",
-        })
-        return behaviors, None
-
-    if standing:
-        best = max(standing, key=_bbox_area)
-        label, conf, _ = classify_person(cheating_model, enhanced, best.bbox, cfg)
-        cx, cy = _bbox_center_xy(best.bbox)
-        thr = cfg.class_flag_thresholds.get("phone", 0.12)
-        bt = "phone" if label == "phone" and conf >= thr else "standing"
-        if prev_center is not None and bt != "phone":
-            d = hypot(cx - prev_center[0], cy - prev_center[1])
-            if d > motion_thresh:
-                bt = "walking"
-        behaviors.append({
-            "behavior_type": bt,
-            "severity": "low",
-            "confidence": float(conf) if bt == "phone" else 0.78,
-            "details": f"standing-area bbox={best.bbox} cheat_classifier={label} ({conf:.3f})",
-        })
-        return behaviors, (cx, cy)
-
-    front = [d for d in seated if d.bbox[3] >= int(0.68 * h)]
-    if front:
-        best = max(front, key=_bbox_area)
-        cx, cy = _bbox_center_xy(best.bbox)
-        bt = "sitting"
-        if prev_center is not None:
-            d = hypot(cx - prev_center[0], cy - prev_center[1])
-            if d > motion_thresh:
-                bt = "walking"
-        behaviors.append({
-            "behavior_type": bt,
-            "severity": "low",
-            "confidence": 0.68,
-            "details": f"front-area seated bbox={best.bbox}",
-        })
-        return behaviors, (cx, cy)
-
-    return [], prev_center
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # CLASSIFICATION
 # ──────────────────────────────────────────────────────────────────────────────
@@ -452,20 +394,28 @@ def classify_person(
             if score > all_scores[cls_name]:
                 all_scores[cls_name] = round(score, 3)
 
+    # Gate 1 — if the model has no strong opinion on this crop at all, bail early.
+    # This prevents low-entropy crops (distant / occluded students) from being
+    # mislabelled as the "least-worst" suspicious class at garbage confidence.
+    max_any_score = max(all_scores.values())
+    if max_any_score < cfg.min_decision_confidence:
+        return "Normal", round(max_any_score, 3), all_scores
+
     normal_score = all_scores["Normal"]
 
-    # Evaluate every suspicious class independently
+    # Gate 2 — each suspicious class must independently clear:
+    #   (a) its own per-class confidence floor, AND
+    #   (b) beat the Normal score by the required margin.
     qualifying: list[tuple[str, float]] = []
     for cls in cfg.suspicious_classes:
         score     = all_scores[cls]
-        threshold = cfg.class_flag_thresholds.get(cls, 0.25)
+        threshold = cfg.class_flag_thresholds.get(cls, 0.35)
         if score >= threshold and score >= normal_score + cfg.margin_over_normal:
             qualifying.append((cls, score))
 
     if not qualifying:
-        # Return the highest-scoring class name for transparency, even if Normal
-        best = max(all_scores, key=all_scores.get)
-        return "Normal", round(all_scores[best], 3), all_scores
+        # Report the actual Normal score (not the phone score) to avoid confusion.
+        return "Normal", round(normal_score, 3), all_scores
 
     best_label, best_conf = max(qualifying, key=lambda x: x[1])
     return best_label, round(best_conf, 3), all_scores
@@ -558,11 +508,10 @@ def run_on_image(
     cfg: Optional[Config] = None,
     save_output: bool = False,
     output_path: Optional[Path] = None,
-    invigilator_prev_center: Optional[tuple[float, float]] = None,
-) -> tuple[list[ClassificationResult], np.ndarray, List[Dict[str, Any]], Optional[tuple[float, float]]]:
+) -> tuple[list[ClassificationResult], np.ndarray]:
     """
     Run detection pipeline on an in-memory image.
-    Returns (student ClassificationResults, annotated image, invigilator behavior dicts, next invigilator center).
+    Returns (list of ClassificationResult, annotated image as numpy array).
     """
     cfg = cfg or Config()
     if save_output:
@@ -574,10 +523,8 @@ def run_on_image(
     # ── Enhance for detection ────────────────────────────────────────────────
     enhanced = enhance_cctv_image(image)
 
-    # ── Load models ──────────────────────────────────────────────────────────
-    log.info("Loading models …")
-    person_model   = YOLO(cfg.person_model_path)
-    cheating_model = YOLO(cfg.cheating_model_path)
+    # ── Load models (cached — skips disk I/O after the first call) ───────────
+    person_model, cheating_model = _get_models(cfg)
 
     # ── Stage 1: Person detection ────────────────────────────────────────────
     t0 = time.perf_counter()
@@ -585,21 +532,13 @@ def run_on_image(
     persons = detect_persons(person_model, enhanced, cfg)
     log.info("Raw detections after NMS: %d  (%.2fs)", len(persons), time.perf_counter() - t0)
 
-    seated, standing = split_seated_standing(persons, cfg)
-    log.info("Seated: %d  |  Standing (invigilator candidates): %d", len(seated), len(standing))
-
-    inv_behaviors, next_inv_center = compute_invigilator_behaviors_for_frame(
-        h, w, persons, seated, standing, cheating_model, enhanced, cfg, invigilator_prev_center
-    )
+    seated, skipped = filter_seated(persons, cfg)
+    log.info("Seated: %d  |  Standing (skipped): %d", len(seated), skipped)
 
     if not seated:
         log.warning("No seated persons detected — check thresholds or image.")
         annotated = draw_results(image, [], cfg)
-        if save_output:
-            out_path = output_path or cfg.output_path
-            cv2.imwrite(str(out_path), annotated)
-            log.info("Output saved: %s", out_path)
-        return [], annotated, inv_behaviors, next_inv_center
+        return [], annotated
 
     # ── Stage 2: Classify each student ──────────────────────────────────────
     log.info("Classifying %d students …", len(seated))
@@ -633,7 +572,7 @@ def run_on_image(
     if save_output:
         print_report(results, cfg)
 
-    return results, annotated, inv_behaviors, next_inv_center
+    return results, annotated
 
 
 def run(cfg: Optional[Config] = None) -> list[ClassificationResult]:
@@ -646,7 +585,7 @@ def run(cfg: Optional[Config] = None) -> list[ClassificationResult]:
         log.error("Could not load image: %s", cfg.image_path)
         return []
 
-    results, _, _, _ = run_on_image(
+    results, _ = run_on_image(
         image,
         cfg=cfg,
         save_output=True,

@@ -24,12 +24,13 @@ from database.api.incidents import router as incidents_router
 from database.api.monitoring import router as monitoring_router
 from database.api.users import router as users_router
 from database.api.seating_plans import router as seating_plans_router
-from database.api.invigilator_plans import router as invigilator_plans_router
 from database.api.notifications import router as notifications_router
 from database.auth import router as auth_router
 from app.seating_plan.upload_plan import router as upload_plan_router
+from database.api.invigilator_plans import router as invigilator_plans_router
 from app.ai_engine.detection_api import router as detection_router
 from database.api.video_streams import router as video_stream_router
+from app.invigilator.invig_api import router as invigilator_monitoring_router
 from database.api.phone_monitoring import router as phone_monitoring_router
 from database.api.stream_proxy import router as stream_proxy_router
 # -------------------------
@@ -54,18 +55,33 @@ app = FastAPI(
 )
 load_dotenv()
 
+
+def _should_log_http_request(request: Request) -> bool:
+    """
+    When QUIET_HTTP_LOGS is set (1/true/yes), skip verbose middleware INFO lines for
+    GET/HEAD/OPTIONS so polling and browser traffic do not flood the console during testing.
+    POST/PUT/PATCH/DELETE always log. Set QUIET_HTTP_LOGS=0 to restore full logging.
+    """
+    if os.getenv("QUIET_HTTP_LOGS", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return True
+    return request.method not in ("GET", "HEAD", "OPTIONS")
+
+
 # -------------------------
 # Request Logging Middleware
 # -------------------------
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    logger.info(f"=== Incoming request: {request.method} {request.url.path} ===")
-    logger.info(f"Client: {request.client.host if request.client else 'unknown'}")
-    logger.info(f"Query params: {dict(request.query_params)}")
-    
+    verbose = _should_log_http_request(request)
+    if verbose:
+        logger.info(f"=== Incoming request: {request.method} {request.url.path} ===")
+        logger.info(f"Client: {request.client.host if request.client else 'unknown'}")
+        logger.info(f"Query params: {dict(request.query_params)}")
+
     try:
         response = await call_next(request)
-        logger.info(f"=== Response: {response.status_code} for {request.method} {request.url.path} ===")
+        if verbose:
+            logger.info(f"=== Response: {response.status_code} for {request.method} {request.url.path} ===")
         return response
     except Exception as e:
         logger.error(f"=== ERROR processing {request.method} {request.url.path}: {str(e)} ===", exc_info=True)
@@ -145,12 +161,13 @@ app.include_router(incidents_router)
 app.include_router(monitoring_router)
 app.include_router(users_router)
 app.include_router(seating_plans_router)
-app.include_router(invigilator_plans_router)
-app.include_router(notifications_router)
+#app.include_router(notifications_router)
 app.include_router(auth_router)
 app.include_router(upload_plan_router)
+app.include_router(invigilator_plans_router)
 app.include_router(detection_router)
 app.include_router(video_stream_router)
+app.include_router(invigilator_monitoring_router)
 app.include_router(phone_monitoring_router)
 app.include_router(stream_proxy_router)
 # -------------------------
@@ -158,12 +175,12 @@ app.include_router(stream_proxy_router)
 # -------------------------
 @app.get("/")
 def root():
-    logger.info("Root endpoint accessed")
+    logger.debug("Root endpoint accessed")
     return {"message": "Welcome to the ForeSyte API!"}
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint"""
-    logger.info("Health check endpoint accessed")
+    """Health check endpoint (often polled — logs at DEBUG only to keep console clean)."""
+    logger.debug("Health check endpoint accessed")
     return {"status": "healthy", "message": "API is running"}
 

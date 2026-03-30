@@ -35,7 +35,6 @@ def process_frame(
     seat_mapping: dict | None = None,
     cfg: Config | None = None,
     return_annotated: bool = False,
-    invigilator_prev_center: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """
     Process a single frame through the cheating detection pipeline.
@@ -53,12 +52,7 @@ def process_frame(
     Returns:
         dict with keys: student_behaviors, invigilator_behaviors, and optionally annotated_frame
     """
-    results, annotated, inv_raw, next_ic = run_on_image(
-        frame,
-        cfg=cfg,
-        save_output=False,
-        invigilator_prev_center=invigilator_prev_center,
-    )
+    results, annotated = run_on_image(frame, cfg=cfg, save_output=False)
 
     student_behaviors = []
     for r in results:
@@ -76,21 +70,12 @@ def process_frame(
             "student_index": r.student_index,
         })
 
-    # Canonical invigilator labels: out of classroom, sitting, standing, walking, phone
-    invigilator_behaviors = [
-        {
-            "behavior_type": b["behavior_type"],
-            "severity": b.get("severity", "low"),
-            "confidence": float(b["confidence"]),
-            "details": b.get("details", ""),
-        }
-        for b in inv_raw
-    ]
+    # AI engine focuses on students; no invigilator detection for now
+    invigilator_behaviors = []
 
     out = {
         "student_behaviors": student_behaviors,
         "invigilator_behaviors": invigilator_behaviors,
-        "invigilator_next_center": next_ic,
     }
     if return_annotated and (student_behaviors or invigilator_behaviors):
         out["annotated_frame"] = annotated

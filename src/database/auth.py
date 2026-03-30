@@ -11,6 +11,7 @@ from uuid import UUID
 import os
 import re
 import logging
+from pathlib import Path
 from database.db import get_db
 from database.models import Admin, Invigilator, Investigator, Student
 from authlib.integrations.starlette_client import OAuth
@@ -25,14 +26,30 @@ class RoleRegisterRequest(BaseModel):
     name: str
     role: str  # admin, invigilator, investigator
 
-load_dotenv()
-FRONTEND_URL = "http://localhost:5173"
+# Load .env from backend root and src (not only cwd — fixes missing GOOGLE_* when uvicorn runs from src/)
+_SRC_DIR = Path(__file__).resolve().parent.parent
+_BACKEND_DIR = _SRC_DIR.parent
+load_dotenv(_BACKEND_DIR / ".env")
+load_dotenv(_SRC_DIR / ".env")
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
+_GOOGLE_CLIENT_ID = (os.getenv("GOOGLE_CLIENT_ID") or "").strip()
+_GOOGLE_CLIENT_SECRET = (os.getenv("GOOGLE_CLIENT_SECRET") or "").strip()
+if not _GOOGLE_CLIENT_ID or ".apps.googleusercontent.com" not in _GOOGLE_CLIENT_ID:
+    logger.warning(
+        "GOOGLE_CLIENT_ID is missing or does not look like a Google OAuth client ID. "
+        "Sign-in with Google will fail with invalid_client. Set GOOGLE_CLIENT_ID and "
+        "GOOGLE_CLIENT_SECRET in %s or %s",
+        _BACKEND_DIR / ".env",
+        _SRC_DIR / ".env",
+    )
 
 oauth = OAuth()
 google = oauth.register(
     name="google",
-    client_id=os.getenv("GOOGLE_CLIENT_ID"),
-    client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+    client_id=_GOOGLE_CLIENT_ID or None,
+    client_secret=_GOOGLE_CLIENT_SECRET or None,
     server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
     client_kwargs={"scope": "openid email profile"},
 )

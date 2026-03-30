@@ -19,9 +19,6 @@ class InvigilatorActivityCreate(BaseModel):
     room_id: UUID
     activity_type: str
     notes: Optional[str] = None
-    severity: Optional[str] = None
-    activity_category: Optional[str] = None
-    duration_seconds: Optional[float] = None
 
 
 class InvigilatorActivityRead(BaseModel):
@@ -30,10 +27,7 @@ class InvigilatorActivityRead(BaseModel):
     room_id: UUID
     timestamp: datetime
     activity_type: str
-    severity: Optional[str] = None
-    activity_category: Optional[str] = None
-    duration_seconds: Optional[float] = None
-    notes: Optional[str] = None
+    notes: Optional[str]
 
     model_config = {
         "from_attributes": True
@@ -54,16 +48,8 @@ class InvigilatorActivityDetailedRead(BaseModel):
     }
 
 
-class InvigilatorActivityEnriched(InvigilatorActivityRead):
-    invigilator_name: Optional[str] = None
-    room_number: Optional[str] = None
-
-
 class InvigilatorActivityUpdate(BaseModel):
     activity_type: Optional[str] = None
-    severity: Optional[str] = None
-    activity_category: Optional[str] = None
-    duration_seconds: Optional[float] = None
     notes: Optional[str] = None
 
 
@@ -101,41 +87,19 @@ def create_invigilator_activity(
     return new_activity
 
 
-def _enrich_activity(db: Session, row: InvigilatorActivity) -> InvigilatorActivityEnriched:
-    inv = db.query(Invigilator).filter(Invigilator.invigilator_id == row.invigilator_id).first()
-    room = db.query(Room).filter(Room.room_id == row.room_id).first()
-    room_label = None
-    if room:
-        room_label = f"{room.block}-{room.room_number}" if room.block else str(room.room_number)
-    return InvigilatorActivityEnriched(
-        activity_id=row.activity_id,
-        invigilator_id=row.invigilator_id,
-        room_id=row.room_id,
-        timestamp=row.timestamp,
-        activity_type=row.activity_type,
-        severity=getattr(row, "severity", None),
-        activity_category=getattr(row, "activity_category", None),
-        duration_seconds=getattr(row, "duration_seconds", None),
-        notes=row.notes,
-        invigilator_name=inv.name if inv else None,
-        room_number=room_label,
-    )
-
-
 # READ All (Admin + Investigator)
-@router.get("/", response_model=List[InvigilatorActivityEnriched])
+@router.get("/", response_model=List[InvigilatorActivityRead])
 def get_all_invigilator_activities(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Admins and Investigators can view all invigilator activities (with invigilator and room labels).
+    Admins and Investigators can view all invigilator activities.
     """
     if current_user.get("user_type") not in ["admin", "investigator"]:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    rows = db.query(InvigilatorActivity).order_by(InvigilatorActivity.timestamp.desc()).all()
-    return [_enrich_activity(db, r) for r in rows]
+    return db.query(InvigilatorActivity).all()
 
 
 @router.get("/me", response_model=List[InvigilatorActivityDetailedRead])
@@ -179,7 +143,7 @@ def get_my_invigilator_activities(
 
 
 # READ by ID (Admin + Investigator)
-@router.get("/{activity_id}", response_model=InvigilatorActivityEnriched)
+@router.get("/{activity_id}", response_model=InvigilatorActivityRead)
 def get_invigilator_activity(
     activity_id: UUID,
     db: Session = Depends(get_db),
@@ -195,7 +159,7 @@ def get_invigilator_activity(
     if not activity:
         raise HTTPException(status_code=404, detail="Invigilator activity not found")
 
-    return _enrich_activity(db, activity)
+    return activity
 
 
 # UPDATE (Admin Only)
