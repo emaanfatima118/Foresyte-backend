@@ -1,6 +1,8 @@
 """
-Adapter to integrate run_detection with video processing.
-Converts ClassificationResult to the behavior format expected by VideoProcessor.
+Adapter: ForeSyte full-frame behaviour detection (uploads/frames/detect.py)
+integrated with video processing.
+
+Converts ClassificationResult rows to the behavior format expected by VideoProcessor.
 """
 
 from __future__ import annotations
@@ -8,24 +10,23 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import cv2
 import numpy as np
 
-from .run_detection import Config, run_on_image
+from .foresyte_detect_pipeline import ForesyteDetectConfig, run_foresyte_on_image
+from .run_detection import ClassificationResult
+from database.cheating_labels import LABEL_SEVERITY
 
 log = logging.getLogger(__name__)
 
 
-# Severity mapping for cheating behaviors (label -> severity)
-LABEL_SEVERITY = {
-    "phone": "high",
-    "Hand Under Table": "high",
-    "Bend Over The Desk": "medium",
-    "Stand Up": "high",
-    "Wave": "medium",
-    "Look Around": "medium",
-    "Normal": "low",
-}
+def run_behaviour_on_frame(
+    image: np.ndarray,
+    cfg: ForesyteDetectConfig | None = None,
+) -> tuple[list[ClassificationResult], np.ndarray]:
+    """
+    Run behaviour detection on one BGR frame (full image, single model pass stack).
+    """
+    return run_foresyte_on_image(image, cfg or ForesyteDetectConfig.from_env())
 
 
 def process_frame(
@@ -33,30 +34,27 @@ def process_frame(
     frame_number: int,
     timestamp,
     seat_mapping: dict | None = None,
-    cfg: Config | None = None,
+    cfg: ForesyteDetectConfig | None = None,
     return_annotated: bool = False,
 ) -> dict[str, Any]:
     """
-    Process a single frame through the cheating detection pipeline.
-    (seat_mapping kept for API compatibility; mapping done in processor via SeatMapper)
-    Returns the format expected by VideoProcessor: student_behaviors, invigilator_behaviors.
+    Process a single extracted frame through full-frame behaviour detection.
 
     Args:
         frame: BGR image (numpy array from cv2)
         frame_number: Frame index in video
         timestamp: datetime of the frame
         seat_mapping: Optional bbox -> seat_id mapping (for future use)
-        cfg: Optional Config override
-        return_annotated: If True, include 'annotated_frame' in result for evidence saving
+        cfg: Optional ForesyteDetectConfig (defaults from env)
+        return_annotated: If True, include 'annotated_frame' when there are behaviors
 
     Returns:
         dict with keys: student_behaviors, invigilator_behaviors, and optionally annotated_frame
     """
-    results, annotated = run_on_image(frame, cfg=cfg, save_output=False)
+    results, annotated = run_behaviour_on_frame(frame, cfg=cfg)
 
     student_behaviors = []
     for r in results:
-        # Only report suspicious behaviors
         if not r.is_suspicious:
             continue
 
@@ -70,7 +68,6 @@ def process_frame(
             "student_index": r.student_index,
         })
 
-    # AI engine focuses on students; no invigilator detection for now
     invigilator_behaviors = []
 
     out = {
@@ -96,9 +93,7 @@ def map_detection_to_seat(behavior: dict, seat_mapping: dict | None) -> str | No
     """
     if not seat_mapping:
         return None
-    # Future: implement bbox center -> polygon containment lookup
     bbox = behavior.get("bbox")
     if not bbox:
         return None
-    # Placeholder: seat_mapping could be dict of (cx,cy) or bbox_hash -> seat_id
     return seat_mapping.get(tuple(bbox))

@@ -12,8 +12,34 @@ from pathlib import Path
 import logging
 import json
 
+from .frame_overlay_timestamp import parse_exam_timestamp_from_frame
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Per video upload / job: uploads/frames/<job_id>/simple/  (raw extracts)
+#                         uploads/frames/<job_id>/pipeline/  (after AI pipeline)
+FRAME_SUBDIR_SIMPLE = "simple"
+FRAME_SUBDIR_PIPELINE = "pipeline"
+
+
+def _sanitize_session_id(job_id: Optional[str]) -> str:
+    if not job_id or not str(job_id).strip():
+        return "default"
+    s = str(job_id).strip()
+    return "".join(c for c in s if c.isalnum() or c in "-_") or "default"
+
+
+def ensure_session_frame_dirs_under(
+    frame_root: Path, job_id: Optional[str]
+) -> tuple[Path, Path]:
+    """Create <frame_root>/<session>/simple and .../pipeline; return both Paths."""
+    session = frame_root.resolve() / _sanitize_session_id(job_id)
+    simple = session / FRAME_SUBDIR_SIMPLE
+    pipeline = session / FRAME_SUBDIR_PIPELINE
+    simple.mkdir(parents=True, exist_ok=True)
+    pipeline.mkdir(parents=True, exist_ok=True)
+    return simple, pipeline
 
 
 class VideoStreamHandler:
@@ -32,6 +58,11 @@ class VideoStreamHandler:
         # Path to seating plan directory
         self.seating_plan_dir = Path(__file__).parent.parent / "seating_plan"
         self.csfyp_dir = self.seating_plan_dir / "CSFYP"
+
+    def ensure_session_frame_dirs(self, job_id: Optional[str]) -> tuple[Path, Path]:
+        """Create uploads/frames/<session>/simple and .../pipeline."""
+        return ensure_session_frame_dirs_under(self.frame_dir, job_id)
+
         
     def validate_video_input(self, source: str, stream_type: str) -> Dict[str, Any]:
         """
@@ -219,9 +250,10 @@ class VideoStreamHandler:
             db_session: Unused for drawing (kept for API compatibility)
             
         Returns:
-            List of extracted frame information
+            List of extracted frame information (frame_path under .../<job_id>/simple/)
         """
         frames_info = []
+        simple_dir, _pipeline_dir = self.ensure_session_frame_dirs(job_id)
         
         # Log video source for debugging
         logger.info(f"Attempting to open video: {video_source}")
@@ -253,9 +285,19 @@ class VideoStreamHandler:
                 
                 # Extract frame based on frame_rate
                 if frame_number % frame_rate == 0:
-                    timestamp = datetime.utcnow()
+                    exam_ts = None
+                    try:
+                        exam_ts = parse_exam_timestamp_from_frame(frame)
+                    except Exception as _ocr_exc:
+                        logger.warning("Exam overlay timestamp OCR error: %s", _ocr_exc)
+                    timestamp = exam_ts if exam_ts is not None else datetime.utcnow()
+                    if exam_ts is None:
+                        logger.debug(
+                            "Frame %s: using processing time as timestamp (OCR disabled or failed)",
+                            frame_number,
+                        )
                     frame_filename = f"frame_{job_id}_{frame_number}_{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
-                    frame_path = self.frame_dir / frame_filename
+                    frame_path = simple_dir / frame_filename
                     # Raw CCTV only — no seating-plan overlay (cleaner input for cheating detection)
                     cv2.imwrite(str(frame_path), frame)
                     
@@ -331,7 +373,11 @@ class VideoStreamHandler:
                 # Process every Nth frame to optimize performance
                 if frame_count % 30 == 0:  # Process 1 frame per second at 30fps
                     if callback:
-                        await callback(frame, frame_count, datetime.utcnow())
+                        try:
+                            _ts = parse_exam_timestamp_from_frame(frame) or datetime.utcnow()
+                        except Exception:
+                            _ts = datetime.utcnow()
+                        await callback(frame, frame_count, _ts)
                     processed_count += 1
                 
                 # Small delay to prevent overwhelming the system

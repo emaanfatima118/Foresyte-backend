@@ -21,6 +21,7 @@ load_dotenv()
 
 from database.db import get_db
 from database.models import VideoStream, ProcessingJob, FrameLog, Exam, Room, StudentActivity, Violation, InvigilatorActivity, Invigilator
+from database.activity_enrichment import enrich_activities, enrich_violations
 from database.auth import get_current_user
 from app.video_processing.processor import VideoProcessor
 
@@ -454,28 +455,37 @@ async def get_processing_results(stream_id: str, db: Session = Depends(get_db)):
                 .all()
             )
 
+            activities_enriched = enrich_activities(db, activities_raw)
             activities = [
                 {
-                    "timestamp": serialize_datetime(a.timestamp),
-                    "behavior_type": a.activity_type,
-                    "severity": a.severity,
-                    "confidence": float(a.confidence) if a.confidence is not None else None,
-                    "evidence_url": a.evidence_url,
+                    "timestamp": serialize_datetime(row["timestamp"]),
+                    "behavior_type": row["activity_type"],
+                    "severity": row["severity"],
+                    "confidence": float(row["confidence"]) if row["confidence"] is not None else None,
+                    "evidence_url": row["evidence_url"],
                     "actor_type": "student",
-                    "student_id": str(a.student_id) if a.student_id else None,
+                    "student_id": str(row["student_id"]) if row.get("student_id") else None,
+                    "student_name": row.get("student_name"),
+                    "seat_number": row.get("seat_number"),
+                    "room": row.get("room"),
                 }
-                for a in activities_raw
+                for row in activities_enriched
             ]
 
+            violations_enriched = enrich_violations(db, violations_raw)
             violations = [
                 {
-                    "violation_type": v.violation_type,
-                    "severity_level": v.severity,
-                    "status": v.status,
-                    "timestamp": serialize_datetime(v.timestamp),
-                    "evidence_url": v.evidence_url,
+                    "violation_type": x["violation_type"],
+                    "severity_level": x["severity"],
+                    "status": x["status"],
+                    "timestamp": serialize_datetime(x["timestamp"]),
+                    "evidence_url": x["evidence_url"],
+                    "student_id": str(x["student_id"]) if x.get("student_id") else None,
+                    "student_name": x.get("student_name"),
+                    "seat_number": x.get("seat_number"),
+                    "room": x.get("room"),
                 }
-                for v in violations_raw
+                for x in violations_enriched
             ]
 
             # Load invigilator activities for this stream's room within the processing window

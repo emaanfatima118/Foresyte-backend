@@ -94,7 +94,7 @@ class Config:
     cheating_model_path: str = field(default_factory=lambda: _resolve_model_path(os.getenv("CHEATING_MODEL_PATH", "besta.pt")))
 
     # Detection thresholds
-    person_conf: float = 0.40       # Person detector confidence floor
+    person_conf: float = 0.15       # Person detector confidence floor
     nms_iou: float = 0.35           # NMS IoU threshold (lower = more aggressive merge)
     dedup_iou: float = 0.70         # IoU above which two boxes are considered duplicate
     standing_aspect_ratio: float = 2.2  # h/w ratio → person is standing, not seated
@@ -167,9 +167,13 @@ class ClassificationResult:
     confidence: float
     all_scores: dict[str, float]
     student_index: int = 0
+    # When set (e.g. ForeSyte full-frame detect.py), overrides label != "Normal"
+    suspicious_override: bool | None = None
 
     @property
     def is_suspicious(self) -> bool:
+        if self.suspicious_override is not None:
+            return self.suspicious_override
         return self.label != "Normal"
 
 

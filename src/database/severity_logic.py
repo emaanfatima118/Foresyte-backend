@@ -13,6 +13,12 @@ from uuid import UUID
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
+from database.cheating_labels import (
+    CHEATING_LABEL_RANK,
+    is_merged_activity_type,
+    split_merged_activity,
+)
+
 # Severity levels (string for StudentActivity, int 1-4 for Violation)
 SEVERITY_LEVELS = ("low", "medium", "high", "critical")
 SEVERITY_TO_INT = {"low": 1, "medium": 2, "high": 3, "critical": 4}
@@ -64,6 +70,44 @@ def _normalize_activity_type(activity_type: str) -> str:
     if "normal" in s or "no violation" in s:
         return "normal"
     return "unknown"
+
+
+def _run_boundary_key(raw: str) -> str:
+    """
+    Key for consecutive-run grouping. Merged strings use exact canonical text;
+    singletons use normalized activity key (legacy behaviour).
+    """
+    s = (raw or "").strip() or "unknown"
+    if is_merged_activity_type(s):
+        return s
+    return _normalize_activity_type(s)
+
+
+def _severity_config_key_for_activity(activity_type: str) -> str:
+    """Config key for ACTIVITY_SEVERITY_CONFIG / escalation: worst component if merged."""
+    s = (activity_type or "").strip()
+    if not s:
+        return "unknown"
+    if is_merged_activity_type(s):
+        parts = split_merged_activity(s)
+        if not parts:
+            return "unknown"
+        best_part = max(parts, key=lambda p: (CHEATING_LABEL_RANK.get(p.strip(), -1), p))
+        return _normalize_activity_type(best_part)
+    return _normalize_activity_type(s)
+
+
+def min_frames_for_activity_type(label_raw: str) -> int:
+    """Min consecutive frames required for a run to qualify (max across merged components)."""
+    s = (label_raw or "").strip()
+    if not s:
+        return MIN_FRAMES_TO_COUNT.get("unknown", 1)
+    if is_merged_activity_type(s):
+        parts = split_merged_activity(s)
+        if not parts:
+            return MIN_FRAMES_TO_COUNT.get("unknown", 1)
+        return max(MIN_FRAMES_TO_COUNT.get(_normalize_activity_type(p), 1) for p in parts)
+    return MIN_FRAMES_TO_COUNT.get(_normalize_activity_type(s), 1)
 
 
 # Per-activity-type config: (min_count, severity) means "at least min_count occurrences -> this severity"
@@ -131,14 +175,19 @@ def get_runs_from_detections(detections: List[Dict[str, Any]]) -> List[LabelRun]
 
     for d in sorted_d:
         raw = (d.get("behavior_type") or d.get("activity_type") or "").strip() or "unknown"
-        key = _normalize_activity_type(raw)
+        key = _run_boundary_key(raw)
         if key != current_key:
             if current and current_key and current_key != "normal":
+                label_raw = (
+                    current[0].get("behavior_type")
+                    or current[0].get("activity_type")
+                    or raw
+                )
                 runs.append(LabelRun(
                     start_ts=current[0].get("timestamp"),
                     end_ts=current[-1].get("timestamp"),
-                    label_raw=current[0].get("behavior_type") or current[0].get("activity_type") or raw,
-                    normalized_key=current_key,
+                    label_raw=label_raw,
+                    normalized_key=_severity_config_key_for_activity(label_raw),
                     frame_count=len(current),
                     first_detection=current[0],
                 ))
@@ -148,11 +197,16 @@ def get_runs_from_detections(detections: List[Dict[str, Any]]) -> List[LabelRun]
             current.append(d)
 
     if current and current_key and current_key != "normal":
+        label_raw = (
+            current[0].get("behavior_type")
+            or current[0].get("activity_type")
+            or "unknown"
+        )
         runs.append(LabelRun(
             start_ts=current[0].get("timestamp"),
             end_ts=current[-1].get("timestamp"),
-            label_raw=current[0].get("behavior_type") or current[0].get("activity_type") or "unknown",
-            normalized_key=current_key,
+            label_raw=label_raw,
+            normalized_key=_severity_config_key_for_activity(label_raw),
             frame_count=len(current),
             first_detection=current[0],
         ))
@@ -163,7 +217,7 @@ def filter_qualifying_runs(runs: List[LabelRun]) -> List[LabelRun]:
     """Keep only runs that meet the min consecutive frames for that label (one violation per run, no redundant)."""
     return [
         r for r in runs
-        if r.frame_count >= MIN_FRAMES_TO_COUNT.get(r.normalized_key, 1)
+        if r.frame_count >= min_frames_for_activity_type(r.label_raw)
     ]
 
 
@@ -176,7 +230,7 @@ def compute_severity_from_count(count: int, activity_type: str) -> str:
     """
     if count < 1:
         count = 1
-    key = _normalize_activity_type(activity_type)
+    key = _severity_config_key_for_activity(activity_type)
     thresholds = ACTIVITY_SEVERITY_CONFIG.get(key, ACTIVITY_SEVERITY_CONFIG["unknown"])
     # thresholds are (min_count, severity) sorted by min_count ascending
     severity = "low"

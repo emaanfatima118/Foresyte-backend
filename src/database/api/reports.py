@@ -1,30 +1,105 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import false as sql_false
 from uuid import UUID
 from datetime import datetime, date
 from typing import List, Optional, Dict, Any
-from pydantic import BaseModel
+from pydantic import BaseModel, computed_field
 import os
 import json
 import csv
 import logging
 from pathlib import Path
+from xml.sax.saxutils import escape as _xml_escape
 
 logger = logging.getLogger(__name__)
 
 try:
-    from reportlab.lib.pagesizes import letter, A4
+    from reportlab.lib.pagesizes import letter, A4, landscape
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
     from reportlab.lib import colors
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image
     from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
     REPORTLAB_AVAILABLE = True
 except ImportError as e:
     REPORTLAB_AVAILABLE = False
     logger.warning("reportlab not installed: %s. PDF generation will create text files. Install with: pip install reportlab", e)
+
+
+def _insert_soft_line_breaks(text: str, max_chars: int = 40) -> str:
+    """
+    Split long strings at word boundaries and join with <br/> so ReportLab Paragraph
+    cannot paint text past the cell (overflow into adjacent columns).
+    Each line is XML-escaped; <br/> is inserted between lines only.
+    """
+    raw = str(text) if text is not None else ""
+    raw = raw.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    words = raw.split()
+    if not words:
+        return _xml_escape(raw.strip())
+    lines: list[list[str]] = []
+    cur: list[str] = []
+    line_len = 0
+    for w in words:
+        add = len(w) + (1 if cur else 0)
+        if cur and line_len + add > max_chars:
+            lines.append(cur)
+            cur = [w]
+            line_len = len(w)
+        else:
+            cur.append(w)
+            line_len += add
+    if cur:
+        lines.append(cur)
+    escaped = [_xml_escape(" ".join(line)) for line in lines]
+    return "<br/>".join(escaped)
+
+
+def _pdf_paragraph_cell(
+    text: Any,
+    style,
+    *,
+    soft_wrap_chars: Optional[int] = None,
+) -> Any:
+    """Single table cell: wrap long text; escape XML for ReportLab Paragraph."""
+    if not REPORTLAB_AVAILABLE:
+        return str(text) if text is not None else ""
+    from reportlab.platypus import Paragraph
+
+    raw = str(text) if text is not None else ""
+    if soft_wrap_chars is not None:
+        safe = _insert_soft_line_breaks(raw, max_chars=max(18, soft_wrap_chars))
+    else:
+        raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+        safe = _xml_escape(raw).replace("\n", "<br/>")
+    return Paragraph(safe, style)
+
+
+def _pdf_link_cell(
+    url: Any,
+    style,
+    *,
+    display_text: Optional[str] = None,
+    soft_wrap_chars: Optional[int] = None,
+) -> Any:
+    """Paragraph cell with wrapped visible text but one full clickable hyperlink."""
+    if not REPORTLAB_AVAILABLE:
+        return str(display_text or url or "")
+    from reportlab.platypus import Paragraph
+
+    raw_url = str(url).strip() if url is not None else ""
+    raw_text = str(display_text if display_text is not None else raw_url)
+    if not raw_url:
+        return Paragraph(_xml_escape(raw_text), style)
+    if soft_wrap_chars is not None:
+        safe_text = _insert_soft_line_breaks(raw_text, max_chars=max(18, soft_wrap_chars))
+    else:
+        safe_text = _xml_escape(raw_text).replace("\n", "<br/>")
+    safe_href = _xml_escape(raw_url).replace("\n", "").replace("\r", "")
+    return Paragraph(f'<link href="{safe_href}">{safe_text}</link>', style)
+
 
 from database.db import get_db, SessionLocal
 from database.models import (
@@ -39,15 +114,161 @@ from database.models import (
     ExamRoomAssignment,
 )
 from database.auth import get_current_user
-from database.severity_logic import severity_from_int
+from database.severity_logic import severity_from_int, SEVERITY_TO_INT
+from database.cheating_labels import is_supported_cheating_activity_type
+from app.storage.blob_storage import (
+    prepare_evidence_files_for_report,
+    upload_report_file,
+    get_report_blob_url,
+    download_report_bytes,
+)
 
 router = APIRouter(prefix="/reports", tags=["Reports"])
+
+
+def _report_row_severity_rank(row: Dict[str, Any]) -> int:
+    """
+    Sort rank for a report activity row: critical=4 … low=1; unknown/N/A=0.
+    Uses activity severity and, when present, nested violation severity (max of both).
+    """
+    def _one(raw: Any) -> int:
+        if raw is None:
+            return 0
+        if isinstance(raw, bool):
+            return 0
+        if isinstance(raw, int):
+            if raw < 1:
+                return 0
+            if raw > 4:
+                return 4
+            return raw
+        s = str(raw).strip().lower()
+        if not s or s in ("n/a", "unknown"):
+            return 0
+        if s.isdigit():
+            v = int(s)
+            return v if 1 <= v <= 4 else 0
+        return int(SEVERITY_TO_INT.get(s, 0))
+
+    r = _one(row.get("severity"))
+    v = row.get("violation")
+    if isinstance(v, dict) and v.get("severity") is not None:
+        r = max(r, _one(v.get("severity")))
+    return r
+
 
 # -------------------------
 # Report Generation Utilities
 # -------------------------
 REPORTS_DIR = Path("uploads/reports")
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _report_blob_url_for_path(file_path: Optional[str]) -> Optional[str]:
+    filename = Path(str(file_path or "")).name
+    if not filename:
+        return None
+    return get_report_blob_url(filename)
+
+
+def _build_report_evidence_items(
+    report_id: str,
+    rows: List[Dict[str, Any]],
+    actor_label: str,
+    *,
+    url_field: str = "report_evidence_url",
+    caption_prefix: str | None = None,
+) -> List[Dict[str, str]]:
+    urls: List[str] = []
+    seen_urls: set[str] = set()
+    captions: Dict[str, str] = {}
+    for row in rows or []:
+        url = str(row.get(url_field) or "").strip()
+        if not url or url in ("N/A", "") or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        urls.append(url)
+        who = row.get("student_name") or row.get("invigilator_name") or actor_label
+        when = row.get("timestamp") or ""
+        behavior = row.get("activity_type") or row.get("type") or ""
+        prefix = caption_prefix or actor_label
+        captions[url] = f"{prefix}: {who} | {behavior} | {when}"
+
+    local_map = prepare_evidence_files_for_report(str(report_id), urls)
+    items: List[Dict[str, str]] = []
+    for url in urls:
+        local_path = local_map.get(url)
+        if local_path:
+            items.append({"path": local_path, "caption": captions.get(url, actor_label)})
+    return items
+
+
+def _build_seat_mapping_embed_items(
+    report_id: str,
+    activities: List[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    """
+    PDF embeds only the shared student seat-mapping frame (identification_evidence_url / *_rolls),
+    not per-violation detection frames (report_evidence_url).
+    """
+    rows: List[Dict[str, Any]] = []
+    for act in activities or []:
+        url = str(act.get("identification_evidence_url") or "").strip()
+        if not url or url in ("N/A", ""):
+            continue
+        rows.append(
+            {
+                "identification_evidence_url": url,
+                "student_name": act.get("student_name"),
+                "activity_type": act.get("activity_type"),
+                "timestamp": act.get("timestamp"),
+            }
+        )
+    return _build_report_evidence_items(
+        str(report_id),
+        rows,
+        "Seat mapping",
+        url_field="identification_evidence_url",
+        caption_prefix="Student seat mapping",
+    )
+
+
+def _append_report_evidence_section(
+    story: List[Any],
+    title: str,
+    evidence_items: List[Dict[str, str]],
+    styles,
+    max_width: float,
+    *,
+    leading_page_break: bool = True,
+) -> None:
+    if not REPORTLAB_AVAILABLE or not evidence_items:
+        return
+
+    if leading_page_break:
+        story.append(PageBreak())
+    else:
+        story.append(Spacer(1, 0.22 * inch))
+    story.append(Paragraph(title, styles["Heading2"]))
+    story.append(Spacer(1, 0.12 * inch))
+    for item in evidence_items:
+        img_path = item.get("path")
+        if not img_path or not Path(img_path).exists():
+            continue
+        try:
+            img = Image(img_path)
+            iw, ih = img.imageWidth, img.imageHeight
+            if iw and ih:
+                scale = min(max_width / float(iw), 4.4 * inch / float(ih), 1.0)
+                img.drawWidth = float(iw) * scale
+                img.drawHeight = float(ih) * scale
+            story.append(Paragraph(_xml_escape(item.get("caption", "")), styles["Normal"]))
+            story.append(Spacer(1, 0.06 * inch))
+            story.append(img)
+            story.append(Spacer(1, 0.18 * inch))
+        except Exception as exc:
+            logger.warning("Failed to embed report evidence image %s: %s", img_path, exc)
+
 
 def generate_json_report(data: Dict[str, Any], file_path: str) -> bool:
     """Generate a comprehensive JSON report file with all details."""
@@ -64,8 +285,12 @@ def generate_json_report(data: Dict[str, Any], file_path: str) -> bool:
             'summary': data.get('summary', {}),
             'exam_information': data.get('exam', {}),
             'activities_and_violations': data.get('activities', []),
-            'invigilator_activities': data.get('invigilator_activities', []),
-            'primary_violation': data.get('primary_violation', None)
+            'primary_violation': data.get('primary_violation', None),
+            'invigilator_activities': (
+                data.get('invigilator_activities', [])
+                if str(data.get('report_type') or '').lower() == 'invigilator'
+                else []
+            ),
         }
         
         with open(full_path, 'w', encoding='utf-8') as f:
@@ -107,6 +332,7 @@ def generate_csv_report(data: Dict[str, Any], file_path: str) -> bool:
                     'Exam': row.get('exam_name', ''),
                     'Room': row.get('room_label', ''),
                     'Evidence_URL': row.get('evidence_url', ''),
+                    'Report_Evidence_URL': row.get('report_evidence_url', ''),
                     'Notes': row.get('notes', ''),
                 })
         elif 'activities' in data:
@@ -116,13 +342,14 @@ def generate_csv_report(data: Dict[str, Any], file_path: str) -> bool:
                     'Activity_ID': activity.get('activity_id', ''),
                     'Student_Name': activity.get('student_name', ''),
                     'Roll_Number': activity.get('student_roll_number', ''),
-                    'Activity_Type': activity.get('activity_type', ''),
+                    'Violation_Type': activity.get('activity_type', ''),
                     'Timestamp': activity.get('timestamp', ''),
                     'Severity': activity.get('severity', ''),
                     'Confidence': activity.get('confidence', ''),
-                    'Evidence_URL': activity.get('evidence_url', ''),
+                    'Cheating_Frame_URL': activity.get('evidence_url', ''),
+                    'Annotated_Report_Frame_URL': activity.get('report_evidence_url', ''),
+                    'Seat_Map_Frame_URL': activity.get('identification_evidence_url', ''),
                     'Violation_ID': violation_info.get('violation_id', 'N/A') if violation_info else 'N/A',
-                    'Violation_Type': violation_info.get('type', 'N/A') if violation_info else 'N/A',
                     'Violation_Severity': violation_info.get('severity', 'N/A') if violation_info else 'N/A',
                     'Violation_Status': violation_info.get('status', 'N/A') if violation_info else 'N/A',
                     'Description': activity.get('description', '')
@@ -173,10 +400,19 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
             logger.error("generate_pdf_report: reportlab not available. Install with: pip install reportlab==4.2.5")
             return False
         
-        # Create PDF document
-        doc = SimpleDocTemplate(str(full_path), pagesize=A4,
-                               rightMargin=72, leftMargin=72,
-                               topMargin=72, bottomMargin=18)
+        # Landscape: wide frame so full-width Activity/Violation paragraphs wrap correctly.
+        _pg_w, _pg_h = landscape(A4)
+        _margin_pt = 56
+        _usable_w_pt = _pg_w - 2 * _margin_pt
+
+        doc = SimpleDocTemplate(
+            str(full_path),
+            pagesize=landscape(A4),
+            rightMargin=_margin_pt,
+            leftMargin=_margin_pt,
+            topMargin=_margin_pt,
+            bottomMargin=44,
+        )
         
         # Container for the 'Flowable' objects
         story = []
@@ -277,66 +513,139 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
             story.append(summary_table)
             story.append(Spacer(1, 0.4*inch))
         
-        # Detailed Activities and Violations section
+        # Embed seat-mapping frame (*_rolls / identification_evidence_url) only — not detection frames.
+        # Evidence column links below stay as-is (evidence / report_evidence URLs).
+        _rt = str(data.get("report_type") or "").lower()
+        if _rt in ("exam", "incident") and data.get("activities"):
+            _seat_items = _build_seat_mapping_embed_items(
+                str(data.get("report_id") or "report"),
+                data["activities"],
+            )
+            if _seat_items:
+                _append_report_evidence_section(
+                    story,
+                    "Student seat mapping",
+                    _seat_items,
+                    styles,
+                    _usable_w_pt * 0.92,
+                    leading_page_break=False,
+                )
+
+        # Detailed Activities table.
+        # Keep Activity in the table itself, but give it a wide column and let the row
+        # grow vertically when the text wraps. Do not repeat Violation text per row.
         if 'activities' in data and data['activities']:
             story.append(Paragraph("Detailed Violation Report", heading_style))
             story.append(Spacer(1, 0.1*inch))
-            
-            # Create detailed table with violations
-            activities_data = [[
-                'Student',
-                'Roll No',
-                'Activity Type',
-                'Time',
-                'Severity',
-                'Violation Type',
-                'Status'
-            ]]
-            
-            for activity in data['activities'][:100]:  # Show up to 100 activities
-                violation_info = activity.get('violation', {})
-                
-                # Determine row color based on severity
-                student_name = activity.get('student_name', 'Unknown')
-                if len(student_name) > 20:
-                    student_name = student_name[:17] + '...'
-                
-                activities_data.append([
-                    student_name,
-                    activity.get('student_roll_number', 'N/A'),
-                    activity.get('activity_type', 'N/A'),
-                    activity.get('timestamp', 'N/A')[-8:] if activity.get('timestamp') else 'N/A',  # Time only
-                    str(activity.get('severity', 'N/A')),
-                    violation_info.get('type', 'N/A') if violation_info else 'N/A',
-                    violation_info.get('status', 'N/A') if violation_info else 'N/A'
-                ])
-            
-            if len(data['activities']) > 100:
-                activities_data.append([
-                    '...', 
-                    f'{len(data["activities"]) - 100} more',
-                    '', '', '', '', ''
-                ])
-            
-            activities_table = Table(
-                activities_data,
-                colWidths=[1.2*inch, 0.8*inch, 1.3*inch, 0.7*inch, 0.6*inch, 1.1*inch, 0.8*inch]
+
+            pdf_cell_style = ParagraphStyle(
+                "PdfActCell",
+                parent=styles["Normal"],
+                fontName="Helvetica",
+                fontSize=7,
+                leading=11,
+                alignment=TA_LEFT,
+                spaceBefore=0,
+                spaceAfter=0,
+                wordWrap="LTR",
             )
-            activities_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#6e5ae6')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 7),
-                ('FONTSIZE', (0, 1), (-1, -1), 6),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-                ('TOPPADDING', (0, 0), (-1, -1), 4),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7fafc')]),
-                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ]))
-            story.append(activities_table)
-            story.append(Spacer(1, 0.3*inch))
+            pdf_header_style = ParagraphStyle(
+                "PdfActHeader",
+                parent=styles["Normal"],
+                fontName="Helvetica-Bold",
+                fontSize=7,
+                leading=11,
+                alignment=TA_LEFT,
+                textColor=colors.whitesmoke,
+                wordWrap="LTR",
+            )
+            # 7 columns: Student, Roll, Violation, Time, Sev., Status, R2 URL.
+            _cw7 = [
+                _usable_w_pt * 0.14,
+                _usable_w_pt * 0.10,
+                _usable_w_pt * 0.22,
+                _usable_w_pt * 0.10,
+                _usable_w_pt * 0.07,
+                _usable_w_pt * 0.10,
+                _usable_w_pt * 0.27,
+            ]
+            _row_pad = TableStyle(
+                [
+                    ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                    ("TOPPADDING", (0, 0), (-1, -1), 5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ]
+            )
+
+            header_row = [
+                [
+                    _pdf_paragraph_cell("Student", pdf_header_style),
+                    _pdf_paragraph_cell("Roll", pdf_header_style),
+                    _pdf_paragraph_cell("Violation", pdf_header_style),
+                    _pdf_paragraph_cell("Time", pdf_header_style),
+                    _pdf_paragraph_cell("Sev.", pdf_header_style),
+                    _pdf_paragraph_cell("Status", pdf_header_style),
+                    _pdf_paragraph_cell("R2 URL", pdf_header_style),
+                ]
+            ]
+            hdr_tbl = Table(header_row, colWidths=_cw7)
+            hdr_style = TableStyle(list(_row_pad.getCommands()))
+            hdr_style.add("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#6e5ae6"))
+            hdr_tbl.setStyle(hdr_style)
+            story.append(hdr_tbl)
+
+            # Include every activity (no cap). Activity wraps in-cell and increases row height.
+            for idx, activity in enumerate(data["activities"]):
+                violation_info = activity.get("violation", {}) or {}
+
+                student_name = activity.get("student_name", "Unknown") or "Unknown"
+                if len(student_name) > 22:
+                    student_name = student_name[:19] + "..."
+
+                ts = activity.get("timestamp", "") or ""
+                time_only = ts[-8:] if len(ts) >= 8 else (ts or "N/A")
+                evidence_url = (
+                    activity.get("evidence_url")
+                    or activity.get("report_evidence_url")
+                    or "N/A"
+                )
+
+                bg = colors.white if idx % 2 == 0 else colors.HexColor("#f7fafc")
+
+                row = [
+                    [
+                        _pdf_paragraph_cell(student_name, pdf_cell_style),
+                        _pdf_paragraph_cell(activity.get("student_roll_number", "N/A"), pdf_cell_style),
+                        _pdf_paragraph_cell(
+                            activity.get("activity_type", "N/A"),
+                            pdf_cell_style,
+                            soft_wrap_chars=55,
+                        ),
+                        _pdf_paragraph_cell(time_only, pdf_cell_style),
+                        _pdf_paragraph_cell(str(activity.get("severity", "N/A")), pdf_cell_style),
+                        _pdf_paragraph_cell(
+                            violation_info.get("status", "N/A") if violation_info else "N/A",
+                            pdf_cell_style,
+                        ),
+                        _pdf_link_cell(
+                            evidence_url,
+                            pdf_cell_style,
+                            display_text="evidence",
+                            soft_wrap_chars=44,
+                        ),
+                    ]
+                ]
+                row_tbl = Table(row, colWidths=_cw7)
+                rs = TableStyle(list(_row_pad.getCommands()))
+                rs.add("BACKGROUND", (0, 0), (-1, 0), bg)
+                row_tbl.setStyle(rs)
+                story.append(row_tbl)
+
+            story.append(Spacer(1, 0.2 * inch))
         
         # Violation section
         if 'violation' in data and data['violation']:
@@ -362,7 +671,7 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
             ]))
             story.append(violation_table)
             story.append(Spacer(1, 0.3*inch))
-        
+
         # Footer
         story.append(Spacer(1, 0.5*inch))
         footer_text = f"Generated by ForeSyte System | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
@@ -392,7 +701,7 @@ def _invigilator_activity_is_violation_row(act: InvigilatorActivity) -> bool:
 
 
 def generate_invigilator_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
-    """PDF for invigilator activity list (separate from student violation PDF layout)."""
+    """PDF for invigilator activity list; each row links to the stored detection frame (R2/blob)."""
     full_path = REPORTS_DIR / Path(file_path).name
     logger.info("generate_invigilator_pdf_report: starting, full_path=%s", full_path)
     try:
@@ -400,7 +709,18 @@ def generate_invigilator_pdf_report(data: Dict[str, Any], file_path: str) -> boo
             full_path = full_path.with_suffix(".pdf")
         if not REPORTLAB_AVAILABLE:
             return False
-        doc = SimpleDocTemplate(str(full_path), pagesize=A4, rightMargin=48, leftMargin=48, topMargin=48, bottomMargin=48)
+        _pg_w, _pg_h = landscape(A4)
+        _margin_pt = 48
+        _usable_w_pt = _pg_w - 2 * _margin_pt
+
+        doc = SimpleDocTemplate(
+            str(full_path),
+            pagesize=landscape(A4),
+            rightMargin=_margin_pt,
+            leftMargin=_margin_pt,
+            topMargin=_margin_pt,
+            bottomMargin=44,
+        )
         story = []
         styles = getSampleStyleSheet()
         title_style = ParagraphStyle(
@@ -412,6 +732,15 @@ def generate_invigilator_pdf_report(data: Dict[str, Any], file_path: str) -> boo
             alignment=TA_CENTER,
             fontName="Helvetica-Bold",
         )
+        heading_style = ParagraphStyle(
+            "InvigHeading",
+            parent=styles["Heading2"],
+            fontSize=14,
+            textColor=colors.HexColor("#4a5568"),
+            spaceAfter=8,
+            spaceBefore=4,
+            fontName="Helvetica-Bold",
+        )
         story.append(Paragraph(data.get("title", "Invigilator Activity Report"), title_style))
         story.append(Spacer(1, 0.15 * inch))
         summary = data.get("summary") or {}
@@ -420,7 +749,7 @@ def generate_invigilator_pdf_report(data: Dict[str, Any], file_path: str) -> boo
             ["Rows:", str(summary.get("total_activities", 0))],
             ["Report mode:", str(data.get("report_mode", "N/A"))],
         ]
-        meta_table = Table(meta_rows, colWidths=[1.8 * inch, 4.5 * inch])
+        meta_table = Table(meta_rows, colWidths=[1.8 * inch, 8.2 * inch])
         meta_table.setStyle(
             TableStyle(
                 [
@@ -431,46 +760,125 @@ def generate_invigilator_pdf_report(data: Dict[str, Any], file_path: str) -> boo
             )
         )
         story.append(meta_table)
-        story.append(Spacer(1, 0.25 * inch))
+        story.append(Spacer(1, 0.2 * inch))
         rows_data = data.get("invigilator_activities") or []
         if not rows_data:
             story.append(Paragraph("No invigilator activities matched the selected filters.", styles["Normal"]))
         else:
-            table_header = [
-                "Time",
-                "Invigilator",
-                "Activity",
-                "Severity",
-                "Exam",
-                "Room",
-            ]
-            pdf_rows = [table_header]
-            for r in rows_data[:200]:
-                pdf_rows.append(
-                    [
-                        str(r.get("timestamp", ""))[:19],
-                        str(r.get("invigilator_name", ""))[:28],
-                        str(r.get("activity_type", ""))[:32],
-                        str(r.get("severity", ""))[:12],
-                        str(r.get("exam_name", ""))[:28],
-                        str(r.get("room_label", ""))[:16],
-                    ]
-                )
-            if len(rows_data) > 200:
-                pdf_rows.append(["…", f"{len(rows_data) - 200} more rows", "", "", "", ""])
-            t = Table(pdf_rows, colWidths=[1.0 * inch, 1.2 * inch, 1.3 * inch, 0.7 * inch, 1.2 * inch, 0.8 * inch])
-            t.setStyle(
-                TableStyle(
-                    [
-                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#6e5ae6")),
-                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                        ("FONTSIZE", (0, 0), (-1, -1), 6),
-                        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ]
-                )
+            story.append(Paragraph("Activities (object-storage frame per row)", heading_style))
+            story.append(Spacer(1, 0.06 * inch))
+            pdf_cell_style = ParagraphStyle(
+                "InvigPdfCell",
+                parent=styles["Normal"],
+                fontName="Helvetica",
+                fontSize=6,
+                leading=9,
+                alignment=TA_LEFT,
+                wordWrap="LTR",
             )
-            story.append(t)
+            pdf_header_style = ParagraphStyle(
+                "InvigPdfHdr",
+                parent=styles["Normal"],
+                fontName="Helvetica-Bold",
+                fontSize=6,
+                leading=9,
+                alignment=TA_LEFT,
+                textColor=colors.whitesmoke,
+                wordWrap="LTR",
+            )
+            _inv_cw = [
+                _usable_w_pt * 0.09,
+                _usable_w_pt * 0.11,
+                _usable_w_pt * 0.17,
+                _usable_w_pt * 0.07,
+                _usable_w_pt * 0.11,
+                _usable_w_pt * 0.07,
+                _usable_w_pt * 0.38,
+            ]
+            _row_pad_inv = TableStyle(
+                [
+                    ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ]
+            )
+            header_row = [
+                [
+                    _pdf_paragraph_cell("Time", pdf_header_style),
+                    _pdf_paragraph_cell("Invigilator", pdf_header_style),
+                    _pdf_paragraph_cell("Activity", pdf_header_style),
+                    _pdf_paragraph_cell("Severity", pdf_header_style),
+                    _pdf_paragraph_cell("Exam", pdf_header_style),
+                    _pdf_paragraph_cell("Room", pdf_header_style),
+                    _pdf_paragraph_cell("Evidence (R2)", pdf_header_style),
+                ]
+            ]
+            hdr_tbl = Table(header_row, colWidths=_inv_cw)
+            hs = TableStyle(list(_row_pad_inv.getCommands()))
+            hs.add("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#6e5ae6"))
+            hdr_tbl.setStyle(hs)
+            story.append(hdr_tbl)
+
+            for idx, r in enumerate(rows_data[:200]):
+                ev_url = str(r.get("report_evidence_url") or r.get("evidence_url") or "").strip()
+                if ev_url and not ev_url.startswith(("http://", "https://")):
+                    ev_cell = _pdf_paragraph_cell(ev_url[:120], pdf_cell_style, soft_wrap_chars=80)
+                elif ev_url:
+                    ev_cell = _pdf_link_cell(
+                        ev_url,
+                        pdf_cell_style,
+                        display_text="open",
+                        soft_wrap_chars=52,
+                    )
+                else:
+                    ev_cell = _pdf_paragraph_cell("N/A", pdf_cell_style)
+
+                bg = colors.white if idx % 2 == 0 else colors.HexColor("#f7fafc")
+                row_tbl = Table(
+                    [
+                        [
+                            _pdf_paragraph_cell(str(r.get("timestamp", ""))[:19], pdf_cell_style),
+                            _pdf_paragraph_cell(
+                                str(r.get("invigilator_name", ""))[:42],
+                                pdf_cell_style,
+                                soft_wrap_chars=28,
+                            ),
+                            _pdf_paragraph_cell(
+                                str(r.get("activity_type", ""))[:56],
+                                pdf_cell_style,
+                                soft_wrap_chars=48,
+                            ),
+                            _pdf_paragraph_cell(str(r.get("severity", ""))[:14], pdf_cell_style),
+                            _pdf_paragraph_cell(
+                                str(r.get("exam_name", ""))[:40],
+                                pdf_cell_style,
+                                soft_wrap_chars=28,
+                            ),
+                            _pdf_paragraph_cell(str(r.get("room_label", ""))[:22], pdf_cell_style),
+                            ev_cell,
+                        ]
+                    ],
+                    colWidths=_inv_cw,
+                )
+                rs = TableStyle(list(_row_pad_inv.getCommands()))
+                rs.add("BACKGROUND", (0, 0), (-1, 0), bg)
+                row_tbl.setStyle(rs)
+                story.append(row_tbl)
+
+            if len(rows_data) > 200:
+                story.append(
+                    Spacer(1, 0.08 * inch),
+                )
+                story.append(
+                    Paragraph(
+                        _xml_escape(f"… {len(rows_data) - 200} more rows not shown"),
+                        styles["Normal"],
+                    ),
+                )
         story.append(Spacer(1, 0.3 * inch))
         story.append(
             Paragraph(
@@ -534,7 +942,7 @@ async def generate_invigilator_report_file_async(
         else:
             q = q.filter(sql_false())
 
-        activities = q.order_by(InvigilatorActivity.timestamp.desc()).limit(5000).all()
+        activities = q.order_by(InvigilatorActivity.timestamp.asc()).limit(5000).all()
 
         violations_only = report_mode in ("all_invigilators_violations", "single_all_exams_violations")
         if violations_only:
@@ -563,11 +971,13 @@ async def generate_invigilator_report_file_async(
                     "exam_name": exam.course if exam else "",
                     "room_label": room_label,
                     "evidence_url": act.evidence_url or "",
+                    "report_evidence_url": getattr(act, "report_evidence_url", "") or "",
                     "notes": act.notes or "",
                 }
             )
 
         report_data: Dict[str, Any] = {
+            "report_id": str(report_id),
             "title": "Invigilator Activity Report",
             "generated_at": datetime.utcnow().isoformat(),
             "report_type": "invigilator",
@@ -602,6 +1012,10 @@ async def generate_invigilator_report_file_async(
                         actual_file = test_file
                         break
                 if actual_file:
+                    try:
+                        upload_report_file(actual_file)
+                    except Exception as upload_exc:
+                        logger.warning("generate_invigilator_report_file_async: blob upload failed for %s: %s", actual_file, upload_exc)
                     report.file_path = f"/reports/{actual_file.name}"
                 else:
                     report.status = "failed"
@@ -648,6 +1062,7 @@ async def generate_report_file_async(
         
         # Prepare comprehensive report data
         report_data = {
+            'report_id': str(report_id),
             'title': f"{report_type.title()} Report",
             'generated_at': datetime.utcnow().isoformat(),
             'report_type': report_type,
@@ -699,7 +1114,12 @@ async def generate_report_file_async(
                     'severity': str(act.severity) if act.severity else 'N/A',
                     'confidence': f"{act.confidence * 100:.1f}%" if act.confidence else 'N/A',
                     'evidence_url': act.evidence_url or 'N/A',
-                    'description': f"{act.activity_type} detected at {act.timestamp.strftime('%H:%M:%S') if act.timestamp else 'unknown time'}"
+                    'report_evidence_url': getattr(act, "report_evidence_url", None) or 'N/A',
+                    'identification_evidence_url': getattr(act, "identification_evidence_url", None) or 'N/A',
+                    'description': (
+                        f"{act.activity_type} at "
+                        f"{act.timestamp.strftime('%H:%M:%S') if act.timestamp else 'unknown time'}"
+                    ),
                 }
                 
                 # Add violation information if exists
@@ -709,13 +1129,21 @@ async def generate_report_file_async(
                         'type': act_violation.violation_type or 'N/A',
                         'severity': act_violation.severity or 0,
                         'status': act_violation.status or 'pending',
-                        'timestamp': act_violation.timestamp.strftime('%Y-%m-%d %H:%M:%S') if act_violation.timestamp else ''
+                        'timestamp': act_violation.timestamp.strftime('%Y-%m-%d %H:%M:%S') if act_violation.timestamp else '',
                     }
                     violations_list.append(activity_detail['violation'])
                 else:
                     activity_detail['violation'] = None
                 
                 detailed_activities.append(activity_detail)
+            # Highest severity first, then roll number; timestamp breaks ties
+            detailed_activities.sort(
+                key=lambda row: (
+                    -_report_row_severity_rank(row),
+                    str(row.get("student_roll_number") or "").lower(),
+                    str(row.get("timestamp") or ""),
+                )
+            )
             
             report_data['activities'] = detailed_activities
             report_data['summary']['total_activities'] = len(activities)
@@ -794,6 +1222,10 @@ async def generate_report_file_async(
                         break
                 
                 if actual_file:
+                    try:
+                        upload_report_file(actual_file)
+                    except Exception as upload_exc:
+                        logger.warning("generate_report_file_async: blob upload failed for %s: %s", actual_file, upload_exc)
                     report.file_path = f"/reports/{actual_file.name}"
                     logger.info("generate_report_file_async: report completed report_id=%s file=%s", report_id, actual_file.name)
                 else:
@@ -904,6 +1336,11 @@ class ReportRead(BaseModel):
         "from_attributes": True
     }
 
+    @computed_field
+    @property
+    def blob_url(self) -> Optional[str]:
+        return _report_blob_url_for_path(self.file_path)
+
 
 class ReportUpdate(BaseModel):
     name: Optional[str] = None  # Rename report
@@ -958,6 +1395,11 @@ class ReportListItem(BaseModel):
     status: str = "generating"
 
     model_config = {"from_attributes": True}
+
+    @computed_field
+    @property
+    def blob_url(self) -> Optional[str]:
+        return _report_blob_url_for_path(self.file_path)
 
 
 class ReportListResponse(BaseModel):
@@ -1135,6 +1577,10 @@ def generate_exam_report(
     activities = db.query(StudentActivity).filter(
         StudentActivity.exam_id == exam_id
     ).all()
+    activities = [
+        a for a in activities
+        if is_supported_cheating_activity_type(a.activity_type or "")
+    ]
     logger.info("generate_exam_report: exam_id=%s activities_count=%s", exam_id, len(activities))
 
     violation = None
@@ -1202,9 +1648,26 @@ def get_invigilator_report_options(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    """List invigilators for the invigilator report dropdown (admin + investigator)."""
-    if current_user.get("user_type") not in ["admin", "investigator"]:
+    """List invigilators for the invigilator report dropdown."""
+    user_type = current_user.get("user_type")
+    user_id = current_user.get("id")
+    if user_type not in ["admin", "investigator", "invigilator"]:
         raise HTTPException(status_code=403, detail="Access denied")
+
+    # Invigilator users can only select themselves.
+    if user_type == "invigilator":
+        try:
+            iid = UUID(str(user_id))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid invigilator token id")
+        me = db.query(Invigilator).filter(Invigilator.invigilator_id == iid).first()
+        return {
+            "invigilators": (
+                [{"invigilator_id": str(me.invigilator_id), "name": me.name, "email": me.email}]
+                if me else []
+            )
+        }
+
     rows = db.query(Invigilator).order_by(Invigilator.name).all()
     return {
         "invigilators": [
@@ -1221,8 +1684,17 @@ def get_invigilator_exam_report_options(
     current_user: dict = Depends(get_current_user),
 ):
     """Exams this invigilator is assigned to (for single-exam detailed report)."""
-    if current_user.get("user_type") not in ["admin", "investigator"]:
+    user_type = current_user.get("user_type")
+    user_id = current_user.get("id")
+    if user_type not in ["admin", "investigator", "invigilator"]:
         raise HTTPException(status_code=403, detail="Access denied")
+    # Invigilator users can only request their own exam options.
+    if user_type == "invigilator":
+        try:
+            invigilator_id = UUID(str(user_id))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid invigilator token id")
+
     exam_ids = (
         db.query(ExamRoomAssignment.exam_id)
         .filter(ExamRoomAssignment.invigilator_id == invigilator_id)
@@ -1253,10 +1725,25 @@ def generate_invigilator_report(
     current_user: dict = Depends(get_current_user),
 ):
     """Generate invigilator activity report (CSV/JSON/PDF)."""
-    if current_user.get("user_type") not in ["admin", "investigator"]:
+    user_type = current_user.get("user_type")
+    user_id = current_user.get("id")
+    if user_type not in ["admin", "investigator", "invigilator"]:
         raise HTTPException(status_code=403, detail="Access denied")
 
     mode = request.report_mode or "all_invigilators_violations"
+    # Invigilators can only generate reports about themselves.
+    if user_type == "invigilator":
+        try:
+            my_id = UUID(str(user_id))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid invigilator token id")
+        if request.invigilator_id and request.invigilator_id != my_id:
+            raise HTTPException(status_code=403, detail="Cannot generate report for another invigilator")
+        request.invigilator_id = my_id
+        # For invigilator role, default to their all-exams violations unless user chose single exam.
+        if mode == "all_invigilators_violations":
+            mode = "single_all_exams_violations"
+
     if mode in ("single_exam_detailed", "single_all_exams_violations") and not request.invigilator_id:
         raise HTTPException(status_code=400, detail="invigilator_id is required for this report mode")
     if mode == "single_exam_detailed" and not request.exam_id:
@@ -1497,6 +1984,17 @@ def download_report(
     
     # Extract filename from path
     filename = Path(report.file_path).name
+    remote_download = download_report_bytes(filename)
+    if remote_download is not None:
+        data, media_type = remote_download
+        return Response(
+            content=data,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}"
+            },
+        )
+
     file_full_path = REPORTS_DIR / filename
     
     # If file doesn't exist, try alternative extensions (for backwards compatibility)

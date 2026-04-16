@@ -32,6 +32,8 @@ class IncidentRead(BaseModel):
     confidence: float
     video_url: Optional[str] = None
     description: Optional[str] = None
+    run_frame_count: Optional[int] = None
+    severity_rule: Optional[str] = None
 
 
 class IncidentStatusUpdate(BaseModel):
@@ -104,7 +106,9 @@ def get_incidents(
             status=violation.status if violation else "investigating",
             confidence=activity.confidence or 0.0,
             video_url=activity.evidence_url,
-            description=None
+            description=None,
+            run_frame_count=getattr(activity, "run_frame_count", None),
+            severity_rule=getattr(activity, "severity_rule", None),
         ))
 
     return IncidentListResponse(
@@ -152,7 +156,9 @@ def get_incident(
         status=violation.status if violation else "investigating",
         confidence=activity.confidence or 0.0,
         video_url=activity.evidence_url,
-        description=None
+        description=None,
+        run_frame_count=getattr(activity, "run_frame_count", None),
+        severity_rule=getattr(activity, "severity_rule", None),
     )
 
 
@@ -211,6 +217,8 @@ def update_incident_status(
         status=violation.status,
         confidence=activity.confidence or 0.0,
         video_url=activity.evidence_url,
-        description=update.notes
+        description=update.notes,
+        run_frame_count=getattr(activity, "run_frame_count", None),
+        severity_rule=getattr(activity, "severity_rule", None),
     )
 

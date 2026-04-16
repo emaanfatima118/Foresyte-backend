@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import desc
 from sqlalchemy.orm import Session
 from uuid import UUID
 from datetime import datetime
@@ -8,6 +9,7 @@ from pydantic import BaseModel
 from database.db import get_db
 from database.models import Violation, StudentActivity
 from database.auth import get_current_user
+from database.activity_enrichment import enrich_violations
 
 router = APIRouter(prefix="/violations", tags=["Violations"])
 
@@ -30,6 +32,12 @@ class ViolationRead(BaseModel):
     severity: int
     status: str
     evidence_url: Optional[str]
+    student_id: Optional[UUID] = None
+    student_name: Optional[str] = None
+    exam_id: Optional[UUID] = None
+    exam_name: Optional[str] = None
+    seat_number: Optional[str] = None
+    room: Optional[str] = None
 
     model_config = {
         "from_attributes": True
@@ -69,7 +77,8 @@ def create_violation(
     db.add(new_violation)
     db.commit()
     db.refresh(new_violation)
-    return new_violation
+    enriched = enrich_violations(db, [new_violation])
+    return ViolationRead(**enriched[0])
 
 
 # READ All (Admin + Investigator)
@@ -84,7 +93,12 @@ def get_all_violations(
     if current_user.get("user_type") not in ["admin", "investigator"]:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    return db.query(Violation).all()
+    rows = (
+        db.query(Violation)
+        .order_by(desc(Violation.severity), Violation.timestamp.asc())
+        .all()
+    )
+    return [ViolationRead(**d) for d in enrich_violations(db, rows)]
 
 
 # READ by ID (Admin + Investigator)
@@ -104,7 +118,8 @@ def get_violation(
     if not violation:
         raise HTTPException(status_code=404, detail="Violation not found")
 
-    return violation
+    enriched = enrich_violations(db, [violation])
+    return ViolationRead(**enriched[0])
 
 
 # UPDATE (Admin Only)
@@ -130,7 +145,8 @@ def update_violation(
 
     db.commit()
     db.refresh(violation)
-    return violation
+    enriched = enrich_violations(db, [violation])
+    return ViolationRead(**enriched[0])
 
 
 # DELETE (Admin Only)
@@ -182,4 +198,4 @@ def get_violations_by_activity_id(
     if not violations:
         raise HTTPException(status_code=404, detail="No violations found for this activity")
 
-    return violations
+    return [ViolationRead(**d) for d in enrich_violations(db, violations)]

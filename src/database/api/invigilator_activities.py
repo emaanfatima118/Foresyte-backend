@@ -28,6 +28,9 @@ class InvigilatorActivityRead(BaseModel):
     timestamp: datetime
     activity_type: str
     notes: Optional[str]
+    invigilator_name: Optional[str] = None
+    room_number: Optional[str] = None
+    block: Optional[str] = None
 
     model_config = {
         "from_attributes": True
@@ -51,6 +54,41 @@ class InvigilatorActivityDetailedRead(BaseModel):
 class InvigilatorActivityUpdate(BaseModel):
     activity_type: Optional[str] = None
     notes: Optional[str] = None
+
+
+def _enrich_invigilator_activities(
+    db: Session, activities: list[InvigilatorActivity]
+) -> list[dict]:
+    if not activities:
+        return []
+    iids = {a.invigilator_id for a in activities if a.invigilator_id}
+    rids = {a.room_id for a in activities if a.room_id}
+    invs = (
+        {i.invigilator_id: i for i in db.query(Invigilator).filter(Invigilator.invigilator_id.in_(iids)).all()}
+        if iids
+        else {}
+    )
+    rooms = (
+        {r.room_id: r for r in db.query(Room).filter(Room.room_id.in_(rids)).all()}
+        if rids
+        else {}
+    )
+    out = []
+    for a in activities:
+        inv = invs.get(a.invigilator_id)
+        rm = rooms.get(a.room_id)
+        out.append({
+            "activity_id": a.activity_id,
+            "invigilator_id": a.invigilator_id,
+            "room_id": a.room_id,
+            "timestamp": a.timestamp,
+            "activity_type": a.activity_type,
+            "notes": a.notes,
+            "invigilator_name": inv.name if inv else None,
+            "room_number": rm.room_number if rm else None,
+            "block": rm.block if rm else None,
+        })
+    return out
 
 
 # -------------------------
@@ -84,7 +122,8 @@ def create_invigilator_activity(
     db.add(new_activity)
     db.commit()
     db.refresh(new_activity)
-    return new_activity
+    row = _enrich_invigilator_activities(db, [new_activity])
+    return InvigilatorActivityRead(**row[0])
 
 
 # READ All (Admin + Investigator)
@@ -99,7 +138,9 @@ def get_all_invigilator_activities(
     if current_user.get("user_type") not in ["admin", "investigator"]:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    return db.query(InvigilatorActivity).all()
+    rows = db.query(InvigilatorActivity).order_by(InvigilatorActivity.timestamp.desc()).all()
+    enriched = _enrich_invigilator_activities(db, rows)
+    return [InvigilatorActivityRead(**d) for d in enriched]
 
 
 @router.get("/me", response_model=List[InvigilatorActivityDetailedRead])
@@ -159,7 +200,8 @@ def get_invigilator_activity(
     if not activity:
         raise HTTPException(status_code=404, detail="Invigilator activity not found")
 
-    return activity
+    row = _enrich_invigilator_activities(db, [activity])
+    return InvigilatorActivityRead(**row[0])
 
 
 # UPDATE (Admin Only)
@@ -185,7 +227,8 @@ def update_invigilator_activity(
 
     db.commit()
     db.refresh(activity)
-    return activity
+    row = _enrich_invigilator_activities(db, [activity])
+    return InvigilatorActivityRead(**row[0])
 
 
 # DELETE (Admin Only)

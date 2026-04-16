@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.live_phone_feeds.phone_stream_receiver import PhoneStreamReceiver
 from app.video_processing.processor import VideoProcessor
+from app.video_processing.stream_handler import ensure_session_frame_dirs_under
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -121,7 +122,10 @@ class PhoneFeedProcessor:
                             return
                     
                     frame_filename = f"phone_{stream_id}_{frame_num}_{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
-                    frame_path = self.frame_dir / frame_filename
+                    simple_dir, _ = ensure_session_frame_dirs_under(
+                        self.frame_dir, stream_id
+                    )
+                    frame_path = simple_dir / frame_filename
                     
                     # Save frame
                     success = cv2.imwrite(str(frame_path), frame)

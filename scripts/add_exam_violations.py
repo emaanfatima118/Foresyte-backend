@@ -170,7 +170,9 @@ def add_exam_violations_and_incidents():
                 activity_type=activity_type,
                 severity=severity_str,
                 confidence=round(random.uniform(0.7, 0.95), 2),
-                evidence_url=f"/evidence/activity_{i+1}.jpg"
+                evidence_url=f"/evidence/activity_{i+1}.jpg",
+                run_frame_count=random.randint(1, 20),
+                severity_rule="legacy",
             )
             
             db.add(activity)

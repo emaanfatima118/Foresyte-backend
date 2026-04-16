@@ -18,8 +18,14 @@ import glob
 from database.db import get_db
 from database.auth import get_current_user
 from app.live_phone_feeds.phone_processor import PhoneFeedProcessor
+from app.video_processing.stream_handler import FRAME_SUBDIR_SIMPLE
 
 logger = logging.getLogger(__name__)
+
+
+def _phone_frames_simple_dir(processor: PhoneFeedProcessor, stream_id: str) -> Path:
+    """uploads/frames/<stream_id>/simple/ for phone captures."""
+    return Path(processor.frame_dir) / stream_id / FRAME_SUBDIR_SIMPLE
 
 router = APIRouter(prefix="/phone-monitoring", tags=["Phone Monitoring"])
 
@@ -198,9 +204,11 @@ async def get_monitoring_status(
     # Fallback: Count frames from directory if live count is 0
     if live_frame_count == 0:
         try:
-            frame_dir = Path(processor.frame_dir)
+            simple_dir = _phone_frames_simple_dir(processor, stream_id)
             pattern = f"phone_{stream_id}_*.jpg"
-            frame_files = list(frame_dir.glob(pattern))
+            frame_files = list(simple_dir.glob(pattern)) if simple_dir.is_dir() else []
+            if not frame_files:
+                frame_files = list(Path(processor.frame_dir).glob(pattern))
             if frame_files:
                 live_frame_count = len(frame_files)
         except Exception as e:
@@ -277,25 +285,32 @@ async def get_latest_frame(
     processor = active_monitoring[session_id]
     stream_id = f"phone-{session_id}"
     
-    # Get the latest frame from saved frames
+    # Get the latest frame from saved frames (per-stream: frames/<stream_id>/simple/)
     frame_dir = Path(processor.frame_dir)
-    
+    simple_dir = _phone_frames_simple_dir(processor, stream_id)
+
     if not frame_dir.exists():
         raise HTTPException(status_code=404, detail=f"Frame directory not found: {frame_dir}")
-    
-    # Search for frames with this stream_id - pattern matches saved frame format
-    # Saved frames: phone_phone-{session_id}_{frame_num}_{timestamp}.jpg
+
     pattern = f"phone_{stream_id}_*.jpg"
-    frame_files = list(frame_dir.glob(pattern))
-    
+    frame_files = list(simple_dir.glob(pattern)) if simple_dir.is_dir() else []
+
     if not frame_files:
-        # Try alternative pattern in case format is slightly different
+        frame_files = list(frame_dir.glob(pattern))
+
+    if not frame_files:
         alt_pattern = f"*{stream_id}*.jpg"
-        frame_files = list(frame_dir.glob(alt_pattern))
-    
+        search_roots = [simple_dir, frame_dir] if simple_dir.is_dir() else [frame_dir]
+        for root in search_roots:
+            frame_files.extend(root.glob(alt_pattern))
+        frame_files = list({p.resolve() for p in frame_files})
+
     if not frame_files:
-        # Try to find any frames with phone_ prefix as last resort
-        all_phone_frames = list(frame_dir.glob("phone_*.jpg"))
+        all_phone_frames = []
+        if simple_dir.is_dir():
+            all_phone_frames.extend(simple_dir.glob("phone_*.jpg"))
+        all_phone_frames.extend(frame_dir.glob("phone_*.jpg"))
+        all_phone_frames = list({p.resolve() for p in all_phone_frames})
         if all_phone_frames:
             # Get the most recent one (might be from a different session but better than nothing)
             latest_frame = max(all_phone_frames, key=os.path.getmtime)

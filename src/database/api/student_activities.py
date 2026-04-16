@@ -9,6 +9,7 @@ from database.db import get_db
 from database.models import StudentActivity, Student, Exam
 from database.auth import get_current_user
 from database.severity_logic import compute_severity
+from database.activity_enrichment import enrich_activities
 
 router = APIRouter(prefix="/student-activities", tags=["Student Activities"])
 
@@ -33,6 +34,12 @@ class StudentActivityRead(BaseModel):
     severity: Optional[str]
     confidence: Optional[float]
     evidence_url: Optional[str]
+    run_frame_count: Optional[int] = None
+    severity_rule: Optional[str] = None
+    student_name: Optional[str] = None
+    exam_name: Optional[str] = None
+    seat_number: Optional[str] = None
+    room: Optional[str] = None
 
     model_config = {
         "from_attributes": True
@@ -44,6 +51,8 @@ class StudentActivityUpdate(BaseModel):
     severity: Optional[str] = None
     confidence: Optional[float] = None
     evidence_url: Optional[str] = None
+    run_frame_count: Optional[int] = None
+    severity_rule: Optional[str] = None
 
 
 # -------------------------
@@ -89,7 +98,8 @@ def create_student_activity(
     db.add(new_activity)
     db.commit()
     db.refresh(new_activity)
-    return new_activity
+    enriched = enrich_activities(db, [new_activity])
+    return StudentActivityRead(**enriched[0])
 
 
 # READ All (Admin + Investigator)
@@ -104,7 +114,8 @@ def get_all_student_activities(
     if current_user.get("user_type") not in ["admin", "investigator"]:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    return db.query(StudentActivity).all()
+    rows = db.query(StudentActivity).all()
+    return [StudentActivityRead(**d) for d in enrich_activities(db, rows)]
 
 
 # READ by ID (Admin + Investigator)
@@ -124,7 +135,8 @@ def get_student_activity(
     if not activity:
         raise HTTPException(status_code=404, detail="Student activity not found")
 
-    return activity
+    enriched = enrich_activities(db, [activity])
+    return StudentActivityRead(**enriched[0])
 
 
 # UPDATE (Admin Only)
@@ -150,7 +162,8 @@ def update_student_activity(
 
     db.commit()
     db.refresh(activity)
-    return activity
+    enriched = enrich_activities(db, [activity])
+    return StudentActivityRead(**enriched[0])
 
 
 # DELETE (Admin Only)
@@ -202,5 +215,4 @@ def get_activities_by_student_id(
 
     activities = db.query(StudentActivity).filter(StudentActivity.student_id == student_id).all()
 
-    # Return empty list instead of 404 if no activities found
-    return activities
+    return [StudentActivityRead(**d) for d in enrich_activities(db, activities)]

@@ -15,7 +15,7 @@ import numpy as np
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from app.ai_engine.run_detection import Config, run_on_image
+from app.ai_engine.foresyte_detect_pipeline import ForesyteDetectConfig, run_foresyte_on_image
 
 log = logging.getLogger(__name__)
 
@@ -54,8 +54,8 @@ async def run_detection(
     image: UploadFile = File(..., description="CCTV/exam room image (JPG, PNG)"),
 ):
     """
-    Run exam cheating detection on an uploaded image.
-    Detects persons, classifies behavior, and returns detections with an annotated image.
+    Run full-frame behaviour detection on an uploaded exam-room image.
+    Returns all behaviour boxes (annotated image + per-detection scores).
     """
     # Validate content type
     if not image.content_type or not image.content_type.startswith("image/"):
@@ -83,12 +83,7 @@ async def run_detection(
     t0 = time.perf_counter()
 
     try:
-        cfg = Config()
-        results, annotated = run_on_image(
-            img,
-            cfg=cfg,
-            save_output=False,
-        )
+        results, annotated = run_foresyte_on_image(img, ForesyteDetectConfig.from_env())
     except Exception as e:
         log.exception("Detection pipeline failed")
         raise HTTPException(

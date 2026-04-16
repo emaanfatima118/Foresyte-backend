@@ -127,6 +127,14 @@ class StudentActivity(Base):
     severity = Column(String)
     confidence = Column(Float)
     evidence_url = Column(Text)
+    # Report appendix frame (student path uses annotated detection frame).
+    report_evidence_url = Column(Text, nullable=True)
+    # Student identification frame with roll numbers under boxes.
+    identification_evidence_url = Column(Text, nullable=True)
+    # Consecutive frames in the qualifying run (video pipeline); used with severity matrix + reports.
+    run_frame_count = Column(Integer, nullable=True)
+    # "matrix" if CURATED_SEVERITY_MATRIX applied; "legacy" if frequency/run logic from severity_logic.
+    severity_rule = Column(String, nullable=True)
 
     student = relationship("Student", back_populates="activities")
     exam = relationship("Exam", back_populates="activities")
@@ -144,6 +152,7 @@ class InvigilatorActivity(Base):
     confidence = Column(Float, nullable=True)         # AI detection confidence
     frame_number = Column(Integer, nullable=True)     # Frame in the video where detected
     evidence_url = Column(Text, nullable=True)        # URL to evidence frame
+    report_evidence_url = Column(Text, nullable=True) # bbox-only frame for report appendix
     notes = Column(Text)
 
     invigilator = relationship("Invigilator", back_populates="activities")

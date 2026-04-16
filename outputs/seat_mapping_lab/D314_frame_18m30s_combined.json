@@ -1,0 +1,472 @@
+{
+  "frame_path": "app\\seating_plan\\CSFYP\\D314-25112025\\D314_frames_2s\\frame_0344_25m38s.jpg",
+  "seat_map_path": "app\\seating_plan\\CSFYP\\D314-25112025\\seat_map.json",
+  "roster_path": "..\\sandbox\\seat_mapping_lab\\roster_d302_example.txt",
+  "output_image": "..\\outputs\\seat_mapping_lab\\D314_frame_18m30s_combined.jpg",
+  "room_no": "D-314",
+  "seat_plan_max_col": 6,
+  "roster_seats_parsed": 36,
+  "persons": 27,
+  "assigned": 26,
+  "suspicious_behaviours": 30,
+  "suspicious": [
+    {
+      "label": "Hand Under Table",
+      "confidence": 0.8582,
+      "bbox": [
+        76,
+        766,
+        158,
+        894
+      ]
+    },
+    {
+      "label": "Hand Under Table",
+      "confidence": 0.8007,
+      "bbox": [
+        510,
+        437,
+        579,
+        545
+      ]
+    },
+    {
+      "label": "Hand Under Table",
+      "confidence": 0.7628,
+      "bbox": [
+        445,
+        263,
+        480,
+        331
+      ]
+    },
+    {
+      "label": "Hand Under Table",
+      "confidence": 0.7579,
+      "bbox": [
+        358,
+        276,
+        404,
+        355
+      ]
+    },
+    {
+      "label": "Hand Under Table",
+      "confidence": 0.7538,
+      "bbox": [
+        649,
+        172,
+        692,
+        238
+      ]
+    },
+    {
+      "label": "Bend Over The Desk",
+      "confidence": 0.7216,
+      "bbox": [
+        91,
+        630,
+        195,
+        753
+      ]
+    },
+    {
+      "label": "Bend Over The Desk",
+      "confidence": 0.709,
+      "bbox": [
+        56,
+        440,
+        113,
+        515
+      ]
+    },
+    {
+      "label": "Hand Under Table",
+      "confidence": 0.7047,
+      "bbox": [
+        559,
+        179,
+        588,
+        242
+      ]
+    },
+    {
+      "label": "Hand Under Table",
+      "confidence": 0.6485,
+      "bbox": [
+        15,
+        357,
+        49,
+        433
+      ]
+    },
+    {
+      "label": "Hand Under Table",
+      "confidence": 0.6415,
+      "bbox": [
+        182,
+        527,
+        216,
+        632
+      ]
+    },
+    {
+      "label": "Bend Over The Desk",
+      "confidence": 0.6256,
+      "bbox": [
+        116,
+        493,
+        197,
+        584
+      ]
+    },
+    {
+      "label": "Hand Under Table",
+      "confidence": 0.5782,
+      "bbox": [
+        1317,
+        397,
+        1382,
+        481
+      ]
+    },
+    {
+      "label": "Hand Under Table",
+      "confidence": 0.5688,
+      "bbox": [
+        486,
+        195,
+        520,
+        254
+      ]
+    },
+    {
+      "label": "Hand Under Table",
+      "confidence": 0.5246,
+      "bbox": [
+        1524,
+        364,
+        1568,
+        431
+      ]
+    },
+    {
+      "label": "Bend Over The Desk",
+      "confidence": 0.4298,
+      "bbox": [
+        1549,
+        322,
+        1616,
+        417
+      ]
+    },
+    {
+      "label": "Bend Over The Desk",
+      "confidence": 0.3868,
+      "bbox": [
+        43,
+        315,
+        97,
+        379
+      ]
+    },
+    {
+      "label": "Hand Under Table",
+      "confidence": 0.3111,
+      "bbox": [
+        741,
+        400,
+        819,
+        471
+      ]
+    },
+    {
+      "label": "Wave",
+      "confidence": 0.2221,
+      "bbox": [
+        755,
+        556,
+        809,
+        641
+      ]
+    },
+    {
+      "label": "phone",
+      "confidence": 0.2137,
+      "bbox": [
+        54,
+        272,
+        76,
+        295
+      ]
+    },
+    {
+      "label": "Hand Under Table",
+      "confidence": 0.1773,
+      "bbox": [
+        202,
+        793,
+        275,
+        850
+      ]
+    },
+    {
+      "label": "Look Around",
+      "confidence": 0.1754,
+      "bbox": [
+        781,
+        303,
+        865,
+        388
+      ]
+    },
+    {
+      "label": "Hand Under Table",
+      "confidence": 0.1318,
+      "bbox": [
+        185,
+        732,
+        282,
+        854
+      ]
+    },
+    {
+      "label": "phone",
+      "confidence": 0.0899,
+      "bbox": [
+        44,
+        263,
+        89,
+        298
+      ]
+    },
+    {
+      "label": "Look Around",
+      "confidence": 0.0767,
+      "bbox": [
+        577,
+        364,
+        632,
+        435
+      ]
+    },
+    {
+      "label": "Hand Under Table",
+      "confidence": 0.0721,
+      "bbox": [
+        847,
+        378,
+        898,
+        452
+      ]
+    },
+    {
+      "label": "Look Around",
+      "confidence": 0.0637,
+      "bbox": [
+        681,
+        483,
+        769,
+        586
+      ]
+    },
+    {
+      "label": "Bend Over The Desk",
+      "confidence": 0.0435,
+      "bbox": [
+        1024,
+        126,
+        1106,
+        189
+      ]
+    },
+    {
+      "label": "Bend Over The Desk",
+      "confidence": 0.0421,
+      "bbox": [
+        750,
+        107,
+        823,
+        170
+      ]
+    },
+    {
+      "label": "Bend Over The Desk",
+      "confidence": 0.0374,
+      "bbox": [
+        52,
+        407,
+        122,
+        457
+      ]
+    },
+    {
+      "label": "Bend Over The Desk",
+      "confidence": 0.0294,
+      "bbox": [
+        672,
+        131,
+        722,
+        229
+      ]
+    }
+  ],
+  "assignments": {
+    "person_3": {
+      "seat_key": "seat_c1r3",
+      "score": 0.7619,
+      "roll_number": "24I-2029",
+      "full_name": "Hanaa Sajid"
+    },
+    "person_5": {
+      "seat_key": "seat_c1r1",
+      "score": 0.6687,
+      "roll_number": "24I-2023",
+      "full_name": "Saim Zaib"
+    },
+    "person_2": {
+      "seat_key": "seat_c1r4",
+      "score": 0.6282,
+      "roll_number": "24I-2030",
+      "full_name": "Muhammad Yahya"
+    },
+    "person_14": {
+      "seat_key": "seat_c8r6",
+      "score": 0.627,
+      "roll_number": null,
+      "full_name": null
+    },
+    "person_4": {
+      "seat_key": "seat_c1r2",
+      "score": 0.6226,
+      "roll_number": "24I-2024",
+      "full_name": "Abubaker Rashid"
+    },
+    "person_15": {
+      "seat_key": "seat_c6r4",
+      "score": 0.5757,
+      "roll_number": "24I-2108",
+      "full_name": "Urba Kaleem"
+    },
+    "person_13": {
+      "seat_key": "seat_c3r1",
+      "score": 0.5417,
+      "roll_number": "24I-2051",
+      "full_name": "Jan Muhammad"
+    },
+    "person_20": {
+      "seat_key": "seat_c8r3",
+      "score": 0.5254,
+      "roll_number": null,
+      "full_name": null
+    },
+    "person_10": {
+      "seat_key": "seat_c3r2",
+      "score": 0.5147,
+      "roll_number": "24I-2059",
+      "full_name": "Wajiha Abbasi"
+    },
+    "person_17": {
+      "seat_key": "seat_c8r4",
+      "score": 0.5102,
+      "roll_number": null,
+      "full_name": null
+    },
+    "person_16": {
+      "seat_key": "seat_c5r2",
+      "score": 0.5023,
+      "roll_number": "24I-2091",
+      "full_name": "Fatima Manzoor"
+    },
+    "person_9": {
+      "seat_key": "seat_c5r5",
+      "score": 0.4885,
+      "roll_number": "24I-2095",
+      "full_name": "Zubair Tariq"
+    },
+    "person_22": {
+      "seat_key": "seat_c8r2",
+      "score": 0.4877,
+      "roll_number": null,
+      "full_name": null
+    },
+    "person_25": {
+      "seat_key": "seat_c10r2",
+      "score": 0.486,
+      "roll_number": null,
+      "full_name": null
+    },
+    "person_8": {
+      "seat_key": "seat_c5r6",
+      "score": 0.4858,
+      "roll_number": "24I-2097",
+      "full_name": "Esha Aslam"
+    },
+    "person_24": {
+      "seat_key": "seat_c8r1",
+      "score": 0.4489,
+      "roll_number": null,
+      "full_name": null
+    },
+    "person_12": {
+      "seat_key": "seat_c6r5",
+      "score": 0.4486,
+      "roll_number": "24I-2110",
+      "full_name": "Azlan Ali"
+    },
+    "person_7": {
+      "seat_key": "seat_c3r5",
+      "score": 0.4194,
+      "roll_number": "24I-2066",
+      "full_name": "Talha Ahmed"
+    },
+    "person_23": {
+      "seat_key": "seat_c10r3",
+      "score": 0.4058,
+      "roll_number": null,
+      "full_name": null
+    },
+    "person_1": {
+      "seat_key": "seat_c1r6",
+      "score": 0.3996,
+      "roll_number": "24I-2036",
+      "full_name": "Alishba Inam"
+    },
+    "person_18": {
+      "seat_key": "seat_c10r6",
+      "score": 0.3992,
+      "roll_number": null,
+      "full_name": null
+    },
+    "person_6": {
+      "seat_key": "seat_c3r6",
+      "score": 0.3938,
+      "roll_number": "24I-2069",
+      "full_name": "Hafsah Yasir"
+    },
+    "person_19": {
+      "seat_key": "seat_c10r5",
+      "score": 0.3833,
+      "roll_number": null,
+      "full_name": null
+    },
+    "person_11": {
+      "seat_key": "seat_c6r6",
+      "score": 0.3644,
+      "roll_number": "24I-2112",
+      "full_name": "Nigah E Zainab"
+    },
+    "person_21": {
+      "seat_key": "seat_c10r4",
+      "score": 0.3634,
+      "roll_number": null,
+      "full_name": null
+    },
+    "person_26": {
+      "seat_key": "seat_c10r1",
+      "score": 0.2887,
+      "roll_number": null,
+      "full_name": null
+    }
+  }
+}
