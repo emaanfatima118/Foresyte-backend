@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +23,7 @@ try:
 except Exception:
     pass
 
-_person_model = None
-_person_path_loaded: str | None = None
+_thread_local = threading.local()
 _anchor_disabled_logged = False
 _model_load_error_logged = False
 
@@ -57,7 +57,8 @@ def _person_boxes_from_frame(
     conf: float,
     imgsz: int,
 ) -> list[tuple[int, int, int, int]]:
-    global _person_model, _person_path_loaded, _model_load_error_logged
+    """One YOLO instance per pipeline thread — parallel uploads use several threads."""
+    global _model_load_error_logged
     path = _resolve_person_model_path(
         os.getenv("PERSON_MODEL_PATH", "yolov8n.pt")
     )
@@ -69,21 +70,27 @@ def _person_boxes_from_frame(
             _model_load_error_logged = True
         return []
 
-    if _person_model is None or _person_path_loaded != path:
+    tl_cache: dict[str, Any] | None = getattr(_thread_local, "person_models", None)
+    if tl_cache is None:
+        tl_cache = {}
+        _thread_local.person_models = tl_cache
+
+    if path not in tl_cache:
         try:
-            _person_model = YOLO(path)
-            _person_path_loaded = path
-            log.info("Person model for seat anchoring: %s", path)
+            tl_cache[path] = YOLO(path)
+            log.info("Person model for seat anchoring: %s (thread-local)", path)
         except Exception as e:
             if not _model_load_error_logged:
                 log.warning("Could not load person model for seat anchor: %s", e)
                 _model_load_error_logged = True
             return []
 
+    yolo = tl_cache[path]
+
     h, w = frame.shape[:2]
     out: list[tuple[int, int, int, int]] = []
     try:
-        for result in _person_model(
+        for result in yolo(
             frame,
             conf=conf,
             classes=[0],
@@ -172,7 +179,7 @@ def attach_person_anchors_for_seats(
         return
 
     conf = float(os.getenv("PERSON_SEAT_CONF", "0.35"))
-    imgsz = int(os.getenv("PERSON_SEAT_IMGSZ", "960"))
+    imgsz = int(os.getenv("PERSON_SEAT_IMGSZ", "640"))
     min_iou = float(os.getenv("PERSON_SEAT_MIN_IOU", "0.05"))
     max_near = float(os.getenv("PERSON_SEAT_MAX_NEAREST_FRAC", "0.28"))
 

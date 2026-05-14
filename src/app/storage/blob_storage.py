@@ -20,12 +20,17 @@ Legacy B2 (optional fallback):
 from __future__ import annotations
 
 import logging
-import os
 import mimetypes
+import os
+import threading
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Avoid repeated R2/B2 uploads of the same local file in one process (same path → same blob key).
+_evidence_upload_cache: dict[str, str] = {}
+_evidence_upload_lock = threading.Lock()
 
 R2_ACCESS_KEY_ID = "R2_ACCESS_KEY_ID"
 R2_SECRET_ACCESS_KEY = "R2_SECRET_ACCESS_KEY"
@@ -167,21 +172,31 @@ def _upload_b2(path: Path, *, kind: str = "evidence") -> Optional[str]:
 def upload_evidence_frame(local_path: str | Path) -> Optional[str]:
     """
     Upload a local image to R2 (preferred) or B2. Returns a public HTTPS URL, or None.
+
+    Repeated calls for the same resolved path reuse the cached URL (no duplicate upload).
     """
     path = Path(local_path)
     if not path.exists() or not path.is_file():
         logger.warning("Evidence frame not found: %s", local_path)
         return None
 
-    if _is_r2_configured():
-        url = _upload_r2(path, kind="evidence")
+    cache_key = str(path.resolve())
+    with _evidence_upload_lock:
+        if cache_key in _evidence_upload_cache:
+            logger.debug(
+                "Evidence upload cache hit, skipping duplicate: %s", cache_key
+            )
+            return _evidence_upload_cache[cache_key]
+
+        url: Optional[str] = None
+        if _is_r2_configured():
+            url = _upload_r2(path, kind="evidence")
+        if not url and _is_b2_configured():
+            url = _upload_b2(path, kind="evidence")
+
         if url:
-            return url
-
-    if _is_b2_configured():
-        return _upload_b2(path, kind="evidence")
-
-    return None
+            _evidence_upload_cache[cache_key] = url
+        return url
 
 
 def upload_report_file(local_path: str | Path) -> Optional[str]:

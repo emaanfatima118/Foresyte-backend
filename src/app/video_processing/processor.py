@@ -4,13 +4,14 @@ Coordinates video processing, AI detection, and database logging
 """
 
 from datetime import datetime
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from collections import defaultdict
 import json
 import asyncio
 import logging
+import multiprocessing
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from functools import partial
 
@@ -45,6 +46,23 @@ def _evidence_path_to_url(file_path: Optional[str]) -> Optional[str]:
         idx = path.find("uploads")
         return "/" + path[idx:]
     return path
+
+
+def _is_remote_evidence_url(url: Optional[str]) -> bool:
+    if not url or not isinstance(url, str):
+        return False
+    u = url.strip().lower()
+    return u.startswith("http://") or u.startswith("https://")
+
+
+def _pipeline_jpeg_write_params():
+    """JPEG params for annotated pipeline frames (aligned with extraction defaults)."""
+    try:
+        q = int(os.getenv("FRAME_PIPELINE_JPEG_QUALITY", os.getenv("FRAME_JPEG_QUALITY", "88")))
+    except ValueError:
+        q = 88
+    q = max(60, min(100, q))
+    return [int(cv2.IMWRITE_JPEG_QUALITY), q]
 
 
 def _pipeline_annotated_path(raw_frame_path: str) -> str:
@@ -286,6 +304,133 @@ def _merge_unmapped_frame_groups(frame_groups: Dict[tuple, List[Dict[str, Any]]]
 
 
 logger = logging.getLogger(__name__)
+
+
+def _parallel_frame_inference_workers() -> int:
+    """
+    Thread count for parallel per-frame student AI on one video (thread-pool path). Celery
+    --concurrency does not split one task across threads; this value does. Override with
+    FRAME_ANALYSIS_THREAD_WORKERS, CELERY_WORKER_CONCURRENCY, or VIDEO_PIPELINE_PARALLEL_WORKERS.
+
+    For multiprocessing (recorded uploads), see FRAME_ANALYSIS_USE_MULTIPROCESSING and
+    FRAME_ANALYSIS_PROCESS_WORKERS.
+    """
+    for key in (
+        "FRAME_ANALYSIS_THREAD_WORKERS",
+        "CELERY_WORKER_CONCURRENCY",
+        "VIDEO_PIPELINE_PARALLEL_WORKERS",
+    ):
+        raw = os.getenv(key)
+        if raw and str(raw).strip():
+            try:
+                return max(1, min(64, int(str(raw).strip())))
+            except ValueError:
+                continue
+    cpus = os.cpu_count() or 4
+    return max(4, min(32, cpus))
+
+
+def _use_multiprocessing_for_frame_inference() -> bool:
+    """
+    When true, recorded student behaviour inference uses a process pool (true parallelism,
+    separate model instances). Set FRAME_ANALYSIS_USE_MULTIPROCESSING=0 to use threads only.
+    Default on; use 0 on single-GPU hosts if VRAM is tight (each process may load weights).
+    """
+    raw = os.getenv("FRAME_ANALYSIS_USE_MULTIPROCESSING", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _parallel_frame_process_workers() -> int:
+    """Max worker processes for recorded student inference. Override FRAME_ANALYSIS_PROCESS_WORKERS."""
+    raw = os.getenv("FRAME_ANALYSIS_PROCESS_WORKERS", "").strip()
+    if raw:
+        try:
+            return max(1, min(32, int(raw)))
+        except ValueError:
+            pass
+    n = _parallel_frame_inference_workers()
+    dev = os.getenv("FORESYTE_DEVICE", "0").strip().lower()
+    if dev == "cpu" or dev.startswith("cpu"):
+        return max(1, min(n, os.cpu_count() or 4))
+    return max(1, min(2, n, os.cpu_count() or 2))
+
+
+def _recorded_invig_stride() -> int:
+    try:
+        return max(
+            1,
+            int(os.getenv("RECORDED_INVIG_EVERY_EXTRACTED_N", "1").strip() or "1"),
+        )
+    except ValueError:
+        return 1
+
+
+def _student_frame_inference_sync(
+    frame_info: Dict[str, Any],
+    *,
+    enable_student: bool,
+    process_frame_fn: Any = None,
+) -> Tuple[Optional[Dict[str, Any]], str, int, Any]:
+    """
+    Stateless per-frame work: load image, run student behaviour model, write annotated pipeline JPEG.
+    Invigilator and seat-mapper person anchors run in the parent process (stateful / DB-bound).
+    """
+    fp = frame_info["frame_path"]
+    fn = frame_info["frame_number"]
+    ts = frame_info["timestamp"]
+
+    import cv2 as _cv2
+
+    frame = _cv2.imread(fp)
+    if frame is None:
+        return None, fp, fn, ts
+
+    if enable_student and process_frame_fn is not None:
+        analysis = process_frame_fn(frame, fn, ts, return_annotated=True)
+    else:
+        analysis = {
+            "student_behaviors": [],
+            "invigilator_behaviors": [],
+        }
+
+    evidence_url = _evidence_path_to_url(fp)
+    if analysis.get("annotated_frame") is not None:
+        ann_path = _pipeline_annotated_path(fp)
+        _cv2.imwrite(ann_path, analysis["annotated_frame"], _pipeline_jpeg_write_params())
+        fp = ann_path
+        evidence_url = _evidence_path_to_url(ann_path)
+        analysis["_pending_blob_path"] = ann_path
+
+    analysis["_evidence_url"] = evidence_url
+    analysis["_frame_path"] = fp
+
+    return analysis, fp, fn, ts
+
+
+def _mp_student_frame_worker(item: Tuple[Dict[str, Any], bool]) -> Tuple[Optional[Dict[str, Any]], str, int, Any]:
+    """Picklable process-pool entry: run student inference for one extracted frame."""
+    frame_info, enable_student = item
+    try:
+        from app.ai_engine.detection_adapter import process_frame as _pf
+    except ImportError:
+        _pf = None
+    return _student_frame_inference_sync(
+        frame_info,
+        enable_student=enable_student and _pf is not None,
+        process_frame_fn=_pf,
+    )
+
+
+def _run_mp_student_frame_batch(
+    items: List[Tuple[Dict[str, Any], bool]],
+    max_workers: int,
+) -> List[Tuple[Optional[Dict[str, Any]], str, int, Any]]:
+    if not items:
+        return []
+    max_workers = max(1, min(max_workers, len(items)))
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as pool:
+        return list(pool.map(_mp_student_frame_worker, items))
 
 
 class VideoProcessor:
@@ -822,10 +967,16 @@ class VideoProcessor:
             student_roll_cache[student_id] = roll
             return roll
         
+        _last_pct_bucket = [-1]
+
         # Extract and process frames
         def progress_callback(processed, total):
             progress = (processed / total * 100) if total > 0 else 0
-            logger.info(f"Progress: {progress:.1f}% ({processed}/{total} frames)")
+            bucket = int(progress // 10)
+            noisy = processed <= 0 or processed >= total or (processed % max(1, total // 8) == 0)
+            if noisy or bucket != _last_pct_bucket[0]:
+                _last_pct_bucket[0] = bucket
+                logger.info("Progress: %.1f%% (%s/%s frames)", progress, processed, total)
             # Call external progress callback if set (for database updates)
             if self.progress_callback:
                 try:
@@ -931,65 +1082,164 @@ class VideoProcessor:
                 )
 
         # Step 4: AI engine processes each frame.
-        # cv2.imread + model inference are blocking CPU/disk operations; run each in the
-        # thread-pool so we don't freeze the event loop between frames.
+        # Student behaviour inference is embarrassingly parallel (process pool or thread pool).
+        # Invigilator adapter is stateful (ByteTrack, counters) — run sequentially in extract order.
 
-        def _analyse_frame_sync(frame_info):
-            """Blocking helper: load frame, run student AI (optional), invigilator AI, save evidence."""
-            fp = frame_info["frame_path"]
-            fn = frame_info["frame_number"]
-            ts = frame_info["timestamp"]
+        needs_frame_ai = bool(self.process_frame or self.invig_adapter)
+        frame_ai_results = None
+        if needs_frame_ai and frames_info:
+            enable_student = bool(self.process_frame)
 
-            import cv2 as _cv2
-            frame = _cv2.imread(fp)
-            if frame is None:
-                return None, fp, fn, ts
-
-            if self.process_frame:
-                analysis = self.process_frame(frame, fn, ts, return_annotated=True)
-            else:
-                analysis = {
-                    "student_behaviors": [],
-                    "invigilator_behaviors": [],
-                }
-
-            # Invigilator runs whenever the adapter is loaded (independent of student AI)
-            if self.invig_adapter is not None:
+            if enable_student and _use_multiprocessing_for_frame_inference():
+                n_proc = min(_parallel_frame_process_workers(), len(frames_info))
+                logger.info(
+                    "Recorded video: student inference via ProcessPoolExecutor "
+                    "(%s workers, %s frames); set FRAME_ANALYSIS_USE_MULTIPROCESSING=0 for threads",
+                    n_proc,
+                    len(frames_info),
+                )
+                items = [(fi, True) for fi in frames_info]
                 try:
-                    invig_behaviors = self.invig_adapter.process_frame(frame, fn, ts)
-                    analysis["invigilator_behaviors"] = invig_behaviors
-                except Exception as _invig_exc:
+                    frame_ai_results = await loop.run_in_executor(
+                        None,
+                        partial(_run_mp_student_frame_batch, items, n_proc),
+                    )
+                except Exception as mp_exc:
                     logger.warning(
-                        "Invigilator detection failed on frame %d: %s",
-                        fn,
-                        _invig_exc,
+                        "Multiprocessing frame batch failed (%s); falling back to thread pool.",
+                        mp_exc,
                         exc_info=True,
                     )
+                    frame_ai_results = None
 
-            evidence_url = _evidence_path_to_url(fp)
-            if analysis.get("annotated_frame") is not None:
-                ann_path = _pipeline_annotated_path(fp)
-                _cv2.imwrite(ann_path, analysis["annotated_frame"])
-                fp = ann_path
-                try:
-                    from app.storage.blob_storage import upload_evidence_frame
-                    blob_url = upload_evidence_frame(ann_path)
-                    evidence_url = blob_url if blob_url else _evidence_path_to_url(ann_path)
-                except Exception as exc:
-                    logger.debug("Blob upload skipped or failed: %s", exc)
-                    evidence_url = _evidence_path_to_url(ann_path)
-
-            analysis["_evidence_url"] = evidence_url
-            analysis["_frame_path"] = fp
-
-            # Seat polygons: align to COCO person box when possible (behaviour bbox unchanged)
-            if seat_mapper and analysis.get("student_behaviors"):
-                from app.video_processing.person_seat_anchor import (
-                    attach_person_anchors_for_seats,
+            if enable_student and frame_ai_results is None:
+                fa_workers = max(2, min(_parallel_frame_inference_workers(), len(frames_info)))
+                cpu_pool = ThreadPoolExecutor(
+                    max_workers=fa_workers,
+                    thread_name_prefix="frame_ai",
                 )
-                attach_person_anchors_for_seats(frame, analysis["student_behaviors"])
+                sem = asyncio.Semaphore(fa_workers)
 
-            return analysis, fp, fn, ts
+                async def _bounded_analyse(fi):
+                    async with sem:
+                        return await loop.run_in_executor(
+                            cpu_pool,
+                            partial(
+                                _student_frame_inference_sync,
+                                fi,
+                                enable_student=True,
+                                process_frame_fn=self.process_frame,
+                            ),
+                        )
+
+                try:
+                    frame_ai_results = await asyncio.gather(
+                        *(_bounded_analyse(fi) for fi in frames_info)
+                    )
+                finally:
+                    cpu_pool.shutdown(wait=True)
+
+            if not enable_student:
+
+                def _empty_student_batch():
+                    return [
+                        _student_frame_inference_sync(
+                            fi,
+                            enable_student=False,
+                            process_frame_fn=None,
+                        )
+                        for fi in frames_info
+                    ]
+
+                frame_ai_results = await loop.run_in_executor(None, _empty_student_batch)
+
+            if seat_mapper and frame_ai_results:
+
+                def _apply_person_anchors_batch():
+                    import cv2 as _cv2
+                    from app.video_processing.person_seat_anchor import (
+                        attach_person_anchors_for_seats,
+                    )
+
+                    for fi, row in zip(frames_info, frame_ai_results):
+                        if not row or row[0] is None:
+                            continue
+                        analysis = row[0]
+                        if not analysis.get("student_behaviors"):
+                            continue
+                        frame = _cv2.imread(fi["frame_path"])
+                        if frame is not None:
+                            attach_person_anchors_for_seats(frame, analysis["student_behaviors"])
+
+                await loop.run_in_executor(None, _apply_person_anchors_batch)
+
+            if self.invig_adapter is not None and frame_ai_results:
+                inv_adapter = self.invig_adapter
+                inv_every = _recorded_invig_stride()
+
+                def _sequential_invigilator_batch():
+                    import cv2 as _cv2
+
+                    for seq, (fi, row) in enumerate(zip(frames_info, frame_ai_results)):
+                        if not row or row[0] is None:
+                            continue
+                        analysis = row[0]
+                        if seq % inv_every != 0:
+                            analysis["invigilator_behaviors"] = []
+                            continue
+                        frame = _cv2.imread(fi["frame_path"])
+                        fn = fi["frame_number"]
+                        ts = fi["timestamp"]
+                        if frame is None:
+                            analysis["invigilator_behaviors"] = []
+                            continue
+                        try:
+                            analysis["invigilator_behaviors"] = inv_adapter.process_frame(
+                                frame, fn, ts
+                            )
+                        except Exception as _invig_exc:
+                            logger.warning(
+                                "Invigilator detection failed on frame %d: %s",
+                                fn,
+                                _invig_exc,
+                                exc_info=True,
+                            )
+                            analysis["invigilator_behaviors"] = []
+
+                await loop.run_in_executor(None, _sequential_invigilator_batch)
+
+            # Batch-upload annotated evidence while DB / merge work is still ahead
+            pending_pairs: list[tuple[int, str]] = []
+            for i, row in enumerate(frame_ai_results or []):
+                if not row or row[0] is None:
+                    continue
+                an = row[0]
+                bp = an.get("_pending_blob_path")
+                if bp:
+                    pending_pairs.append((i, bp))
+
+            if pending_pairs:
+
+                def _upload_evidence_blob(local_path: str) -> Optional[str]:
+                    try:
+                        from app.storage.blob_storage import upload_evidence_frame
+
+                        return upload_evidence_frame(local_path)
+                    except Exception as exc:
+                        logger.debug("Batch evidence upload failed: %s", exc)
+                        return None
+
+                u_workers = min(24, max(4, len(pending_pairs)))
+                with ThreadPoolExecutor(
+                    max_workers=u_workers, thread_name_prefix="evidence_up"
+                ) as ux:
+                    urls = list(ux.map(_upload_evidence_blob, [p for _, p in pending_pairs]))
+
+                for (batch_i, _), blob_url in zip(pending_pairs, urls):
+                    an = frame_ai_results[batch_i][0]
+                    an.pop("_pending_blob_path", None)
+                    if blob_url:
+                        an["_evidence_url"] = blob_url
 
         for idx, frame_info in enumerate(frames_info):
             raw_frame_source = frame_info['frame_path']
@@ -997,10 +1247,8 @@ class VideoProcessor:
             frame_number = frame_info['frame_number']
             timestamp = frame_info['timestamp']
 
-            if self.process_frame or self.invig_adapter:
-                analysis, frame_path, frame_number, timestamp = await loop.run_in_executor(
-                    None, _analyse_frame_sync, frame_info
-                )
+            if needs_frame_ai:
+                analysis, frame_path, frame_number, timestamp = frame_ai_results[idx]
                 if analysis is None:
                     logger.warning(f"Failed to load frame: {frame_info['frame_path']}")
                     continue
@@ -1084,15 +1332,20 @@ class VideoProcessor:
             ]
             if shared_student_report_bboxes:
                 shared_student_report_evidence_path = frame_path
-                shared_student_report_evidence_url = _evidence_path_to_url(frame_path)
-                try:
-                    from app.storage.blob_storage import upload_evidence_frame
+                # Student AI already uploads annotated *_detection.jpg in _analyse_frame_sync;
+                # re-uploading here doubled R2 traffic for the same file.
+                if _is_remote_evidence_url(evidence_url_preferred):
+                    shared_student_report_evidence_url = evidence_url_preferred
+                else:
+                    shared_student_report_evidence_url = _evidence_path_to_url(frame_path)
+                    try:
+                        from app.storage.blob_storage import upload_evidence_frame
 
-                    ru = upload_evidence_frame(frame_path)
-                    if ru:
-                        shared_student_report_evidence_url = ru
-                except Exception as _rep_up_exc:
-                    logger.debug("Report frame blob upload skipped: %s", _rep_up_exc)
+                        ru = upload_evidence_frame(frame_path)
+                        if ru:
+                            shared_student_report_evidence_url = ru
+                    except Exception as _rep_up_exc:
+                        logger.debug("Report frame blob upload skipped: %s", _rep_up_exc)
                 identification_evidence_path = seat_mapping_identification_path
                 identification_evidence_url = seat_mapping_identification_url
             for _gkey, blist in frame_student_groups.items():
@@ -1130,8 +1383,25 @@ class VideoProcessor:
                 )
                 detections_by_student[sk].append(detection)
             
+            # Dedupe duplicate invigilator rows for the same frame (adapter can repeat).
+            _seen_invig_key: set[tuple] = set()
             # Process invigilator behaviors — persist detection frame to blob (R2) for this row
             for behavior in invigilator_behaviors:
+                bbox = behavior.get("bbox") or ()
+                bbox_key = (
+                    tuple(int(round(float(x))) for x in bbox[:4])
+                    if len(bbox) >= 4
+                    else ()
+                )
+                dk = (
+                    str(behavior.get("behavior_type") or ""),
+                    behavior.get("tracker_id"),
+                    bbox_key,
+                )
+                if dk in _seen_invig_key:
+                    continue
+                _seen_invig_key.add(dk)
+
                 report_evidence_path = None
                 report_evidence_url = None
                 rf = _get_report_frame()

@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 # Load .env before reading any environment variables
 load_dotenv()
 
+
 from database.db import get_db
 from database.models import VideoStream, ProcessingJob, FrameLog, Exam, Room, StudentActivity, Violation, InvigilatorActivity, Invigilator
 from database.activity_enrichment import enrich_activities, enrich_violations
@@ -286,15 +287,15 @@ async def upload_exam_footage(
         else:
             logger.warning("USE_DATABASE=false — stream record will not persist after restart")
         
-        # Start processing in background
-        background_tasks.add_task(
-            process_video_background,
-            str(stream_id),
-            video_path,
-            str(exam_uuid),
-            str(room_uuid),
-            "recorded",
-            USE_DATABASE
+        # Start processing: Celery workers (USE_CELERY=1) or FastAPI BackgroundTasks
+        _enqueue_video_processing(
+            stream_id=str(stream_id),
+            video_path=video_path,
+            exam_id=str(exam_uuid),
+            room_id=str(room_uuid),
+            stream_type="recorded",
+            use_database=USE_DATABASE,
+            background_tasks=background_tasks,
         )
         
         # Convert absolute path to frontend-accessible URL
@@ -933,11 +934,24 @@ async def process_video_background(
         processor = VideoProcessor(db, enable_ai=True)
         seat_mapping = {}  # TODO: Load from seating plan
         
-        # Create progress callback to update ProcessingJob during extraction
+        # Avoid committing to Postgres on every extracted frame (major slowdown on CPU).
+        _pcb_state = {"last_commit": -1}
+
         def update_progress_callback(processed: int, total: int):
-            """Update ProcessingJob with frame extraction progress"""
+            """Update ProcessingJob with frame extraction progress (throttled commits)."""
             if db and use_database:
                 try:
+                    interval = max(
+                        1,
+                        int(os.getenv("PROCESSING_JOB_PROGRESS_COMMIT_INTERVAL", "10")),
+                    )
+                    milestone = (
+                        processed <= 0
+                        or processed >= total
+                        or (processed % interval == 0)
+                    )
+                    if not milestone:
+                        return
                     job = db.query(ProcessingJob).filter(
                         ProcessingJob.stream_id == UUID(stream_id)
                     ).first()
@@ -946,7 +960,13 @@ async def process_video_background(
                         job.processed_frames = processed
                         job.progress = (processed / total * 100) if total > 0 else 0.0
                         db.commit()
-                        logger.info(f"Updated progress: {processed}/{total} frames ({job.progress:.1f}%)")
+                        _pcb_state["last_commit"] = processed
+                        logger.info(
+                            "Updated progress (DB): %s/%s frames (%.1f%%)",
+                            processed,
+                            total,
+                            job.progress,
+                        )
                 except Exception as e:
                     logger.warning(f"Failed to update progress: {e}")
                     db.rollback()
@@ -1045,3 +1065,55 @@ async def process_video_background(
     finally:
         if db:
             db.close()
+
+
+def _enqueue_video_processing(
+    *,
+    stream_id: str,
+    video_path: str,
+    exam_id: str,
+    room_id: str,
+    stream_type: str,
+    use_database: bool,
+    background_tasks: Optional[BackgroundTasks],
+) -> None:
+    """Dispatch processing to Celery workers or in-process BackgroundTasks."""
+    use_celery = os.getenv("USE_CELERY", "").strip().lower() in ("1", "true", "yes", "on")
+    if use_celery:
+        try:
+            from app.worker.tasks import process_uploaded_video
+
+            process_uploaded_video.delay(
+                stream_id,
+                video_path,
+                exam_id,
+                room_id,
+                stream_type,
+                bool(use_database),
+            )
+            logger.info("Queued video processing to Celery (stream_id=%s)", stream_id)
+        except Exception as exc:
+            logger.error(
+                "USE_CELERY enabled but Celery dispatch failed (%s); "
+                "set USE_CELERY=0 or fix the broker/worker.",
+                exc,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Video queued for processing is unavailable (Celery). "
+                "Start workers or set USE_CELERY=0 to process in-process.",
+            ) from exc
+        return
+
+    if background_tasks is None:
+        raise RuntimeError("background_tasks is required when USE_CELERY is disabled")
+    background_tasks.add_task(
+        process_video_background,
+        stream_id,
+        video_path,
+        exam_id,
+        room_id,
+        stream_type,
+        use_database,
+    )

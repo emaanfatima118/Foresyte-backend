@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 from uuid import UUID
@@ -84,20 +84,34 @@ def create_violation(
 # READ All (Admin + Investigator)
 @router.get("/", response_model=List[ViolationRead])
 def get_all_violations(
+    exam_id: Optional[UUID] = Query(
+        None,
+        description="If set, only violations tied to a student activity in this exam.",
+    ),
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Admins and Investigators can view all violations.
+    Optional exam_id filters to violations from that exam only.
     """
     if current_user.get("user_type") not in ["admin", "investigator"]:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    rows = (
-        db.query(Violation)
-        .order_by(desc(Violation.severity), Violation.timestamp.asc())
-        .all()
-    )
+    if exam_id is None:
+        rows = (
+            db.query(Violation)
+            .order_by(desc(Violation.severity), Violation.timestamp.asc())
+            .all()
+        )
+    else:
+        rows = (
+            db.query(Violation)
+            .join(StudentActivity, Violation.activity_id == StudentActivity.activity_id)
+            .filter(StudentActivity.exam_id == exam_id)
+            .order_by(desc(Violation.severity), Violation.timestamp.asc())
+            .all()
+        )
     return [ViolationRead(**d) for d in enrich_violations(db, rows)]
 
 

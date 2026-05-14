@@ -20,15 +20,16 @@ router = APIRouter()
 # Global store for latest extracted room
 latest_room_data = {}
 
-# Paths for storage and visualization
-EXTRACTIONS_DIR = Path("./app/seating_plan/extractions")
-EXTRACTIONS_DIR.mkdir(exist_ok=True)
+# Paths for storage and visualization — anchored to this package so cwd does not matter
+_SEATING_PLAN_PACKAGE = Path(__file__).resolve().parent
+EXTRACTIONS_DIR = _SEATING_PLAN_PACKAGE / "extractions"
+EXTRACTIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-CSFYP_DIR = Path("./app/seating_plan/CSFYP")
+CSFYP_DIR = _SEATING_PLAN_PACKAGE / "CSFYP"
 
 # Default paths (fallback)
-SEAT_MAP_PATH = Path("./app/seating_plan/seat_map.json")
-CCTV_IMAGE_PATH = Path("./app/seating_plan/cctv_frame.jpg")
+SEAT_MAP_PATH = _SEATING_PLAN_PACKAGE / "seat_map.json"
+CCTV_IMAGE_PATH = _SEATING_PLAN_PACKAGE / "cctv_frame.jpg"
 
 # -------- Utility Functions --------
 def normalize_time_slot(time_str):

@@ -150,7 +150,7 @@ def convert_exam_to_read(exam: Exam) -> ExamRead:
 def get_exams(
     status_filter: Optional[str] = Query(None, alias="status"),
     page: int = Query(1, ge=1),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(20, ge=1, le=500),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
