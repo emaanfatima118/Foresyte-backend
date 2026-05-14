@@ -395,126 +395,231 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
     try:
         if not full_path.suffix.lower() == '.pdf':
             full_path = full_path.with_suffix('.pdf')
-        
+
         if not REPORTLAB_AVAILABLE:
             logger.error("generate_pdf_report: reportlab not available. Install with: pip install reportlab==4.2.5")
             return False
-        
-        # Landscape: wide frame so full-width Activity/Violation paragraphs wrap correctly.
+
+        # ── Palette ──────────────────────────────────────────────────────────
+        C_PRIMARY   = colors.HexColor('#5C4DE8')   # indigo brand
+        C_PRIMARY_D = colors.HexColor('#3B2DB5')   # darker shade for accents
+        C_BG_LIGHT  = colors.HexColor('#F5F4FF')   # very light lavender page tint
+        C_PANEL     = colors.HexColor('#FFFFFF')
+        C_BORDER    = colors.HexColor('#E2E0F8')
+        C_TEXT      = colors.HexColor('#1A1A2E')
+        C_MUTED     = colors.HexColor('#64748B')
+        C_STRIPE    = colors.HexColor('#F8F7FF')
+
+        SEV_COLORS = {
+            'critical': (colors.HexColor('#FEE2E2'), colors.HexColor('#DC2626')),  # bg, text
+            'high':     (colors.HexColor('#FEF3C7'), colors.HexColor('#D97706')),
+            'medium':   (colors.HexColor('#DBEAFE'), colors.HexColor('#2563EB')),
+            'low':      (colors.HexColor('#D1FAE5'), colors.HexColor('#059669')),
+        }
+
+        # ── Page geometry ────────────────────────────────────────────────────
         _pg_w, _pg_h = landscape(A4)
-        _margin_pt = 56
-        _usable_w_pt = _pg_w - 2 * _margin_pt
+        _margin_h = 50
+        _margin_v_top = 72   # leave room for running header
+        _margin_v_bot = 50
+        _usable_w = _pg_w - 2 * _margin_h
+
+        # ── Running header / footer drawn on every page ──────────────────────
+        _report_title = data.get('title', 'Exam Report')
+        _gen_ts = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+
+        def _on_page(canvas, doc):
+            canvas.saveState()
+            # Header bar
+            bar_h = 28
+            canvas.setFillColor(C_PRIMARY)
+            canvas.rect(0, _pg_h - bar_h, _pg_w, bar_h, fill=1, stroke=0)
+            canvas.setFont('Helvetica-Bold', 9)
+            canvas.setFillColor(colors.white)
+            canvas.drawString(_margin_h, _pg_h - bar_h + 9, 'FORESYTE')
+            canvas.setFont('Helvetica', 9)
+            canvas.drawRightString(_pg_w - _margin_h, _pg_h - bar_h + 9, _report_title)
+            # Thin accent line under header
+            canvas.setStrokeColor(C_PRIMARY_D)
+            canvas.setLineWidth(0.5)
+            canvas.line(_margin_h, _pg_h - bar_h - 1, _pg_w - _margin_h, _pg_h - bar_h - 1)
+            # Footer
+            canvas.setFont('Helvetica', 7.5)
+            canvas.setFillColor(C_MUTED)
+            canvas.drawString(_margin_h, 22, f'Generated {_gen_ts}  |  ForeSyte Exam Monitoring System')
+            canvas.drawRightString(_pg_w - _margin_h, 22, f'Page {doc.page}')
+            canvas.setStrokeColor(C_BORDER)
+            canvas.setLineWidth(0.5)
+            canvas.line(_margin_h, 32, _pg_w - _margin_h, 32)
+            canvas.restoreState()
 
         doc = SimpleDocTemplate(
             str(full_path),
             pagesize=landscape(A4),
-            rightMargin=_margin_pt,
-            leftMargin=_margin_pt,
-            topMargin=_margin_pt,
-            bottomMargin=44,
+            rightMargin=_margin_h,
+            leftMargin=_margin_h,
+            topMargin=_margin_v_top,
+            bottomMargin=_margin_v_bot,
         )
-        
-        # Container for the 'Flowable' objects
+
         story = []
-        
-        # Define styles
         styles = getSampleStyleSheet()
-        
-        # Custom styles
+
+        # ── Shared text styles ────────────────────────────────────────────────
         title_style = ParagraphStyle(
-            'CustomTitle',
-            parent=styles['Heading1'],
-            fontSize=24,
-            textColor=colors.HexColor('#6e5ae6'),
-            spaceAfter=30,
-            alignment=TA_CENTER,
-            fontName='Helvetica-Bold'
+            'FsTitle', parent=styles['Heading1'],
+            fontSize=26, textColor=C_PRIMARY, spaceAfter=4,
+            alignment=TA_CENTER, fontName='Helvetica-Bold',
         )
-        
-        heading_style = ParagraphStyle(
-            'CustomHeading',
-            parent=styles['Heading2'],
-            fontSize=16,
-            textColor=colors.HexColor('#4a5568'),
-            spaceAfter=12,
-            spaceBefore=12,
-            fontName='Helvetica-Bold'
+        subtitle_style = ParagraphStyle(
+            'FsSubtitle', parent=styles['Normal'],
+            fontSize=11, textColor=C_MUTED, spaceAfter=20,
+            alignment=TA_CENTER, fontName='Helvetica',
         )
-        
-        # Title
+        section_style = ParagraphStyle(
+            'FsSection', parent=styles['Heading2'],
+            fontSize=13, textColor=C_PRIMARY, spaceAfter=6,
+            spaceBefore=16, fontName='Helvetica-Bold',
+        )
+        cell_style = ParagraphStyle(
+            'FsCell', parent=styles['Normal'],
+            fontName='Helvetica', fontSize=8, leading=12,
+            alignment=TA_LEFT, wordWrap='LTR',
+        )
+        cell_bold = ParagraphStyle(
+            'FsCellBold', parent=cell_style, fontName='Helvetica-Bold',
+        )
+        header_cell_style = ParagraphStyle(
+            'FsHdrCell', parent=styles['Normal'],
+            fontName='Helvetica-Bold', fontSize=8, leading=12,
+            alignment=TA_LEFT, textColor=colors.white, wordWrap='LTR',
+        )
+
+        # ── Helper: section heading with divider ──────────────────────────────
+        def _section_heading(text: str) -> list:
+            elems = [
+                Spacer(1, 0.15 * inch),
+                Paragraph(text, section_style),
+            ]
+            rule = Table([['']], colWidths=[_usable_w])
+            rule.setStyle(TableStyle([
+                ('LINEBELOW', (0, 0), (-1, 0), 1.5, C_PRIMARY),
+                ('TOPPADDING', (0, 0), (-1, 0), 0),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 0),
+            ]))
+            elems.append(rule)
+            elems.append(Spacer(1, 0.1 * inch))
+            return elems
+
+        # ── Title block ───────────────────────────────────────────────────────
         title = data.get('title', 'Report')
         story.append(Paragraph(title, title_style))
-        story.append(Spacer(1, 0.2*inch))
-        
-        # Report metadata
-        metadata_data = [
-            ['Generated:', datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')],
-            ['Report Type:', data.get('report_type', 'N/A')],
-        ]
-        
-        if 'exam' in data:
-            exam_info = data['exam']
-            metadata_data.append(['Exam:', exam_info.get('name', 'N/A')])
-            metadata_data.append(['Exam Date:', exam_info.get('date', 'N/A')])
-        
-        metadata_table = Table(metadata_data, colWidths=[2*inch, 4*inch])
-        metadata_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f7fafc')),
-            ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-            ('TOPPADDING', (0, 0), (-1, -1), 8),
-            ('GRID', (0, 0), (-1, -1), 1, colors.grey),
-        ]))
-        story.append(metadata_table)
-        story.append(Spacer(1, 0.3*inch))
-        
-        # Summary section
-        if 'summary' in data and data['summary']:
-            story.append(Paragraph("Executive Summary", heading_style))
-            summary_data = [['Metric', 'Value']]
-            
-            # Format summary data with better presentation
-            summary = data['summary']
+
+        exam_info = data.get('exam') or {}
+        subtitle_parts = []
+        if exam_info.get('name'):
+            subtitle_parts.append(exam_info['name'])
+        if exam_info.get('date'):
+            subtitle_parts.append(f"Date: {exam_info['date']}")
+        rtype = str(data.get('report_type', '')).title()
+        if rtype:
+            subtitle_parts.append(f"Type: {rtype}")
+        subtitle_parts.append(f"Generated: {_gen_ts}")
+        story.append(Paragraph('  ·  '.join(subtitle_parts), subtitle_style))
+
+        # ── Summary cards ─────────────────────────────────────────────────────
+        summary = data.get('summary') or {}
+        if summary:
+            story.extend(_section_heading("Executive Summary"))
+
+            # Top-line stats row
+            stat_items = []
             if 'total_activities' in summary:
-                summary_data.append(['Total Activities Detected', str(summary['total_activities'])])
+                stat_items.append(('Total Activities', str(summary['total_activities'])))
             if 'total_violations' in summary:
-                summary_data.append(['Total Violations', str(summary['total_violations'])])
+                stat_items.append(('Total Violations', str(summary['total_violations'])))
             if 'unique_students_flagged' in summary:
-                summary_data.append(['Unique Students Flagged', str(summary['unique_students_flagged'])])
-            if 'exam_name' in summary:
-                summary_data.append(['Exam Name', summary['exam_name']])
-            if 'exam_date' in summary:
-                summary_data.append(['Exam Date', summary['exam_date']])
-            
-            # Add severity breakdown if available
-            if 'severity_breakdown' in summary:
-                severity = summary['severity_breakdown']
-                story.append(Spacer(1, 0.1*inch))
-                summary_data.append(['--- Severity Breakdown ---', ''])
-                for level, count in severity.items():
-                    if count > 0:
-                        summary_data.append([f'{level.title()} Severity', str(count)])
-            
-            summary_table = Table(summary_data, colWidths=[3.5*inch, 2.5*inch])
-            summary_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#6e5ae6')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, -1), 10),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-                ('TOPPADDING', (0, 0), (-1, -1), 8),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7fafc')]),
-                ('GRID', (0, 0), (-1, -1), 1, colors.grey),
-            ]))
-            story.append(summary_table)
-            story.append(Spacer(1, 0.4*inch))
-        
-        # Embed seat-mapping frame (*_rolls / identification_evidence_url) only — not detection frames.
-        # Evidence column links below stay as-is (evidence / report_evidence URLs).
+                stat_items.append(('Students Flagged', str(summary['unique_students_flagged'])))
+            if exam_info.get('name'):
+                stat_items.append(('Exam', exam_info['name']))
+
+            if stat_items:
+                card_w = _usable_w / max(len(stat_items), 1)
+                card_data = [[
+                    Table(
+                        [[Paragraph(f'<b>{v}</b>', ParagraphStyle(
+                            f'Sv{i}', parent=styles['Normal'],
+                            fontSize=20, fontName='Helvetica-Bold',
+                            textColor=C_PRIMARY, alignment=TA_CENTER,
+                        ))],
+                         [Paragraph(label, ParagraphStyle(
+                            f'Sl{i}', parent=styles['Normal'],
+                            fontSize=8, fontName='Helvetica',
+                            textColor=C_MUTED, alignment=TA_CENTER,
+                        ))]],
+                        colWidths=[card_w - 12],
+                    )
+                    for i, (label, v) in enumerate(stat_items)
+                ]]
+                card_row = Table(card_data, colWidths=[card_w] * len(stat_items))
+                card_row.setStyle(TableStyle([
+                    ('ALIGN',          (0, 0), (-1, -1), 'CENTER'),
+                    ('VALIGN',         (0, 0), (-1, -1), 'MIDDLE'),
+                    ('BOX',            (0, 0), (-1, -1), 1, C_BORDER),
+                    ('INNERGRID',      (0, 0), (-1, -1), 0.5, C_BORDER),
+                    ('BACKGROUND',     (0, 0), (-1, -1), C_BG_LIGHT),
+                    ('TOPPADDING',     (0, 0), (-1, -1), 10),
+                    ('BOTTOMPADDING',  (0, 0), (-1, -1), 10),
+                    ('LEFTPADDING',    (0, 0), (-1, -1), 6),
+                    ('RIGHTPADDING',   (0, 0), (-1, -1), 6),
+                ]))
+                story.append(card_row)
+                story.append(Spacer(1, 0.18 * inch))
+
+            # Severity breakdown as colored badge row
+            sev_bd = summary.get('severity_breakdown') or {}
+            sev_order = [('critical', 'Critical'), ('high', 'High'), ('medium', 'Medium'), ('low', 'Low')]
+            sev_cells = []
+            for key, label in sev_order:
+                count = sev_bd.get(key, 0)
+                bg_c, txt_c = SEV_COLORS.get(key, (C_BG_LIGHT, C_TEXT))
+                sev_cells.append(
+                    Table(
+                        [[Paragraph(f'<b>{label}</b>', ParagraphStyle(
+                            f'SBL{key}', parent=styles['Normal'],
+                            fontSize=8, fontName='Helvetica-Bold',
+                            textColor=txt_c, alignment=TA_CENTER,
+                        ))],
+                         [Paragraph(str(count), ParagraphStyle(
+                            f'SBC{key}', parent=styles['Normal'],
+                            fontSize=18, fontName='Helvetica-Bold',
+                            textColor=txt_c, alignment=TA_CENTER,
+                        ))]],
+                        colWidths=[_usable_w / 4 - 12],
+                    )
+                )
+            if any(sev_bd.get(k, 0) for k, _ in sev_order):
+                sev_row = Table([sev_cells], colWidths=[_usable_w / 4] * 4)
+                sev_row.setStyle(TableStyle([
+                    ('ALIGN',         (0, 0), (-1, -1), 'CENTER'),
+                    ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+                    ('TOPPADDING',    (0, 0), (-1, -1), 10),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                    ('LEFTPADDING',   (0, 0), (-1, -1), 4),
+                    ('RIGHTPADDING',  (0, 0), (-1, -1), 4),
+                    ('BOX',           (0, 0), (0, 0), 1, colors.HexColor('#FECACA')),
+                    ('BOX',           (1, 0), (1, 0), 1, colors.HexColor('#FDE68A')),
+                    ('BOX',           (2, 0), (2, 0), 1, colors.HexColor('#BFDBFE')),
+                    ('BOX',           (3, 0), (3, 0), 1, colors.HexColor('#A7F3D0')),
+                    ('BACKGROUND',    (0, 0), (0, 0), colors.HexColor('#FEE2E2')),
+                    ('BACKGROUND',    (1, 0), (1, 0), colors.HexColor('#FEF3C7')),
+                    ('BACKGROUND',    (2, 0), (2, 0), colors.HexColor('#DBEAFE')),
+                    ('BACKGROUND',    (3, 0), (3, 0), colors.HexColor('#D1FAE5')),
+                ]))
+                story.append(sev_row)
+                story.append(Spacer(1, 0.25 * inch))
+
+        # ── Seat-mapping image (if any) ───────────────────────────────────────
         _rt = str(data.get("report_type") or "").lower()
         if _rt in ("exam", "incident") and data.get("activities"):
             _seat_items = _build_seat_mapping_embed_items(
@@ -522,166 +627,131 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
                 data["activities"],
             )
             if _seat_items:
+                story.extend(_section_heading("Student Seat Mapping"))
                 _append_report_evidence_section(
-                    story,
-                    "Student seat mapping",
-                    _seat_items,
-                    styles,
-                    _usable_w_pt * 0.92,
-                    leading_page_break=False,
+                    story, "", _seat_items, styles,
+                    _usable_w * 0.92, leading_page_break=False,
                 )
 
-        # Detailed Activities table.
-        # Keep Activity in the table itself, but give it a wide column and let the row
-        # grow vertically when the text wraps. Do not repeat Violation text per row.
-        if 'activities' in data and data['activities']:
-            story.append(Paragraph("Detailed Violation Report", heading_style))
-            story.append(Spacer(1, 0.1*inch))
+        # ── Detailed violation table ──────────────────────────────────────────
+        if data.get('activities'):
+            story.extend(_section_heading("Detailed Violation Report"))
 
-            pdf_cell_style = ParagraphStyle(
-                "PdfActCell",
-                parent=styles["Normal"],
-                fontName="Helvetica",
-                fontSize=7,
-                leading=11,
-                alignment=TA_LEFT,
-                spaceBefore=0,
-                spaceAfter=0,
-                wordWrap="LTR",
-            )
-            pdf_header_style = ParagraphStyle(
-                "PdfActHeader",
-                parent=styles["Normal"],
-                fontName="Helvetica-Bold",
-                fontSize=7,
-                leading=11,
-                alignment=TA_LEFT,
-                textColor=colors.whitesmoke,
-                wordWrap="LTR",
-            )
-            # 7 columns: Student, Roll, Violation, Time, Sev., Status, R2 URL.
-            _cw7 = [
-                _usable_w_pt * 0.14,
-                _usable_w_pt * 0.10,
-                _usable_w_pt * 0.22,
-                _usable_w_pt * 0.10,
-                _usable_w_pt * 0.07,
-                _usable_w_pt * 0.10,
-                _usable_w_pt * 0.27,
+            # Column widths: Student | Roll | Violation | Time | Severity | Status | Evidence
+            _cw = [
+                _usable_w * 0.14,
+                _usable_w * 0.10,
+                _usable_w * 0.24,
+                _usable_w * 0.09,
+                _usable_w * 0.09,
+                _usable_w * 0.09,
+                _usable_w * 0.25,
             ]
-            _row_pad = TableStyle(
-                [
-                    ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                    ("TOPPADDING", (0, 0), (-1, -1), 5),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ]
-            )
 
-            header_row = [
-                [
-                    _pdf_paragraph_cell("Student", pdf_header_style),
-                    _pdf_paragraph_cell("Roll", pdf_header_style),
-                    _pdf_paragraph_cell("Violation", pdf_header_style),
-                    _pdf_paragraph_cell("Time", pdf_header_style),
-                    _pdf_paragraph_cell("Sev.", pdf_header_style),
-                    _pdf_paragraph_cell("Status", pdf_header_style),
-                    _pdf_paragraph_cell("R2 URL", pdf_header_style),
-                ]
-            ]
-            hdr_tbl = Table(header_row, colWidths=_cw7)
-            hdr_style = TableStyle(list(_row_pad.getCommands()))
-            hdr_style.add("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#6e5ae6"))
-            hdr_tbl.setStyle(hdr_style)
+            _base_ts = TableStyle([
+                ('ALIGN',         (0, 0), (-1, -1), 'LEFT'),
+                ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+                ('LEFTPADDING',   (0, 0), (-1, -1), 6),
+                ('RIGHTPADDING',  (0, 0), (-1, -1), 6),
+                ('TOPPADDING',    (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                ('LINEBELOW',     (0, 0), (-1, -1), 0.4, C_BORDER),
+            ])
+
+            # Header
+            hdr_data = [[
+                _pdf_paragraph_cell(h, header_cell_style)
+                for h in ('Student', 'Roll No.', 'Violation', 'Time', 'Severity', 'Status', 'Evidence')
+            ]]
+            hdr_tbl = Table(hdr_data, colWidths=_cw)
+            hdr_ts = TableStyle(list(_base_ts.getCommands()))
+            hdr_ts.add('BACKGROUND',     (0, 0), (-1, -1), C_PRIMARY)
+            hdr_ts.add('TOPPADDING',     (0, 0), (-1, -1), 8)
+            hdr_ts.add('BOTTOMPADDING',  (0, 0), (-1, -1), 8)
+            hdr_tbl.setStyle(hdr_ts)
             story.append(hdr_tbl)
 
-            # Include every activity (no cap). Activity wraps in-cell and increases row height.
             for idx, activity in enumerate(data["activities"]):
                 violation_info = activity.get("violation", {}) or {}
 
-                student_name = activity.get("student_name", "Unknown") or "Unknown"
-                if len(student_name) > 22:
-                    student_name = student_name[:19] + "..."
+                student_name = str(activity.get("student_name") or "Unknown")
+                if len(student_name) > 24:
+                    student_name = student_name[:21] + "…"
 
-                ts = activity.get("timestamp", "") or ""
-                time_only = ts[-8:] if len(ts) >= 8 else (ts or "N/A")
+                ts = str(activity.get("timestamp") or "")
+                time_only = ts[-8:] if len(ts) >= 8 else (ts or "—")
+
                 evidence_url = (
                     activity.get("evidence_url")
                     or activity.get("report_evidence_url")
-                    or "N/A"
+                    or ""
                 )
 
-                bg = colors.white if idx % 2 == 0 else colors.HexColor("#f7fafc")
+                sev_raw = str(activity.get("severity") or "").strip().lower()
+                sev_bg, sev_txt = SEV_COLORS.get(sev_raw, (C_BG_LIGHT, C_TEXT))
+                sev_label = sev_raw.title() if sev_raw else "—"
 
-                row = [
-                    [
-                        _pdf_paragraph_cell(student_name, pdf_cell_style),
-                        _pdf_paragraph_cell(activity.get("student_roll_number", "N/A"), pdf_cell_style),
-                        _pdf_paragraph_cell(
-                            activity.get("activity_type", "N/A"),
-                            pdf_cell_style,
-                            soft_wrap_chars=55,
-                        ),
-                        _pdf_paragraph_cell(time_only, pdf_cell_style),
-                        _pdf_paragraph_cell(str(activity.get("severity", "N/A")), pdf_cell_style),
-                        _pdf_paragraph_cell(
-                            violation_info.get("status", "N/A") if violation_info else "N/A",
-                            pdf_cell_style,
-                        ),
-                        _pdf_link_cell(
-                            evidence_url,
-                            pdf_cell_style,
-                            display_text="evidence",
-                            soft_wrap_chars=44,
-                        ),
-                    ]
-                ]
-                row_tbl = Table(row, colWidths=_cw7)
-                rs = TableStyle(list(_row_pad.getCommands()))
-                rs.add("BACKGROUND", (0, 0), (-1, 0), bg)
-                row_tbl.setStyle(rs)
+                sev_badge_style = ParagraphStyle(
+                    f'Sev{idx}', parent=styles['Normal'],
+                    fontName='Helvetica-Bold', fontSize=7.5,
+                    textColor=sev_txt, alignment=TA_CENTER,
+                )
+
+                row_bg = C_PANEL if idx % 2 == 0 else C_STRIPE
+                row_data = [[
+                    _pdf_paragraph_cell(student_name, cell_bold),
+                    _pdf_paragraph_cell(activity.get("student_roll_number") or "—", cell_style),
+                    _pdf_paragraph_cell(activity.get("activity_type") or "—", cell_style, soft_wrap_chars=60),
+                    _pdf_paragraph_cell(time_only, cell_style),
+                    Paragraph(sev_label, sev_badge_style),
+                    _pdf_paragraph_cell(
+                        violation_info.get("status", "pending") if violation_info else "—",
+                        cell_style,
+                    ),
+                    _pdf_link_cell(evidence_url, cell_style, display_text="View evidence", soft_wrap_chars=50)
+                    if evidence_url else _pdf_paragraph_cell("—", cell_style),
+                ]]
+                row_tbl = Table(row_data, colWidths=_cw)
+                row_ts = TableStyle(list(_base_ts.getCommands()))
+                row_ts.add('BACKGROUND', (0, 0), (-1, -1), row_bg)
+                row_ts.add('BACKGROUND', (4, 0), (4, 0), sev_bg)
+                row_ts.add('ROUNDEDCORNERS', [2])
+                row_tbl.setStyle(row_ts)
                 story.append(row_tbl)
 
-            story.append(Spacer(1, 0.2 * inch))
-        
-        # Violation section
-        if 'violation' in data and data['violation']:
-            story.append(Paragraph("Violation Details", heading_style))
-            violation = data['violation']
-            violation_data = [
-                ['Violation ID:', violation.get('id', 'N/A')],
-                ['Type:', violation.get('type', 'N/A')],
-                ['Severity:', str(violation.get('severity', 'N/A'))],
-                ['Status:', violation.get('status', 'N/A')],
-            ]
-            
-            violation_table = Table(violation_data, colWidths=[2*inch, 4*inch])
-            violation_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f7fafc')),
-                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, -1), 10),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-                ('TOPPADDING', (0, 0), (-1, -1), 8),
-                ('GRID', (0, 0), (-1, -1), 1, colors.grey),
-            ]))
-            story.append(violation_table)
-            story.append(Spacer(1, 0.3*inch))
+            story.append(Spacer(1, 0.25 * inch))
 
-        # Footer
-        story.append(Spacer(1, 0.5*inch))
-        footer_text = f"Generated by ForeSyte System | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
-        story.append(Paragraph(footer_text, styles['Normal']))
-        
-        # Build PDF
-        doc.build(story)
+        # ── Violation detail block (single-violation reports) ─────────────────
+        if data.get('violation'):
+            story.extend(_section_heading("Violation Details"))
+            violation = data['violation']
+            vd = [
+                ['Violation ID', violation.get('id', '—')],
+                ['Type',         violation.get('type', '—')],
+                ['Severity',     str(violation.get('severity', '—'))],
+                ['Status',       violation.get('status', '—')],
+            ]
+            vt = Table(vd, colWidths=[1.8 * inch, _usable_w - 1.8 * inch])
+            vt.setStyle(TableStyle([
+                ('BACKGROUND',    (0, 0), (0, -1), C_BG_LIGHT),
+                ('FONTNAME',      (0, 0), (0, -1), 'Helvetica-Bold'),
+                ('FONTSIZE',      (0, 0), (-1, -1), 9),
+                ('TEXTCOLOR',     (0, 0), (-1, -1), C_TEXT),
+                ('ALIGN',         (0, 0), (-1, -1), 'LEFT'),
+                ('TOPPADDING',    (0, 0), (-1, -1), 7),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 7),
+                ('LEFTPADDING',   (0, 0), (-1, -1), 8),
+                ('LINEBELOW',     (0, 0), (-1, -1), 0.4, C_BORDER),
+                ('BOX',           (0, 0), (-1, -1), 1, C_BORDER),
+            ]))
+            story.append(vt)
+            story.append(Spacer(1, 0.3 * inch))
+
+        # ── Build ─────────────────────────────────────────────────────────────
+        doc.build(story, onFirstPage=_on_page, onLaterPages=_on_page)
         logger.info("generate_pdf_report: success, path=%s", full_path)
         return True
-        
+
     except Exception as e:
         logger.exception("generate_pdf_report failed: file_path=%s, error=%s", file_path, e)
         return False
@@ -709,184 +779,208 @@ def generate_invigilator_pdf_report(data: Dict[str, Any], file_path: str) -> boo
             full_path = full_path.with_suffix(".pdf")
         if not REPORTLAB_AVAILABLE:
             return False
+
+        # ── Palette (shared with exam report) ────────────────────────────────
+        C_PRIMARY   = colors.HexColor('#5C4DE8')
+        C_PRIMARY_D = colors.HexColor('#3B2DB5')
+        C_BG_LIGHT  = colors.HexColor('#F5F4FF')
+        C_BORDER    = colors.HexColor('#E2E0F8')
+        C_PANEL     = colors.HexColor('#FFFFFF')
+        C_STRIPE    = colors.HexColor('#F8F7FF')
+        C_TEXT      = colors.HexColor('#1A1A2E')
+        C_MUTED     = colors.HexColor('#64748B')
+        SEV_COLORS = {
+            'critical': (colors.HexColor('#FEE2E2'), colors.HexColor('#DC2626')),
+            'high':     (colors.HexColor('#FEF3C7'), colors.HexColor('#D97706')),
+            'medium':   (colors.HexColor('#DBEAFE'), colors.HexColor('#2563EB')),
+            'low':      (colors.HexColor('#D1FAE5'), colors.HexColor('#059669')),
+        }
+
         _pg_w, _pg_h = landscape(A4)
-        _margin_pt = 48
-        _usable_w_pt = _pg_w - 2 * _margin_pt
+        _margin_h = 50
+        _margin_v_top = 72
+        _margin_v_bot = 50
+        _usable_w = _pg_w - 2 * _margin_h
+
+        _report_title = data.get("title", "Invigilator Activity Report")
+        _gen_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+        def _on_page(canvas, doc):
+            canvas.saveState()
+            bar_h = 28
+            canvas.setFillColor(C_PRIMARY)
+            canvas.rect(0, _pg_h - bar_h, _pg_w, bar_h, fill=1, stroke=0)
+            canvas.setFont('Helvetica-Bold', 9)
+            canvas.setFillColor(colors.white)
+            canvas.drawString(_margin_h, _pg_h - bar_h + 9, 'FORESYTE')
+            canvas.setFont('Helvetica', 9)
+            canvas.drawRightString(_pg_w - _margin_h, _pg_h - bar_h + 9, _report_title)
+            canvas.setStrokeColor(C_PRIMARY_D)
+            canvas.setLineWidth(0.5)
+            canvas.line(_margin_h, _pg_h - bar_h - 1, _pg_w - _margin_h, _pg_h - bar_h - 1)
+            canvas.setFont('Helvetica', 7.5)
+            canvas.setFillColor(C_MUTED)
+            canvas.drawString(_margin_h, 22, f'Generated {_gen_ts}  |  ForeSyte Exam Monitoring System')
+            canvas.drawRightString(_pg_w - _margin_h, 22, f'Page {doc.page}')
+            canvas.setStrokeColor(C_BORDER)
+            canvas.setLineWidth(0.5)
+            canvas.line(_margin_h, 32, _pg_w - _margin_h, 32)
+            canvas.restoreState()
 
         doc = SimpleDocTemplate(
             str(full_path),
             pagesize=landscape(A4),
-            rightMargin=_margin_pt,
-            leftMargin=_margin_pt,
-            topMargin=_margin_pt,
-            bottomMargin=44,
+            rightMargin=_margin_h,
+            leftMargin=_margin_h,
+            topMargin=_margin_v_top,
+            bottomMargin=_margin_v_bot,
         )
         story = []
         styles = getSampleStyleSheet()
+
         title_style = ParagraphStyle(
-            "InvigTitle",
-            parent=styles["Heading1"],
-            fontSize=20,
-            textColor=colors.HexColor("#6e5ae6"),
-            spaceAfter=16,
-            alignment=TA_CENTER,
-            fontName="Helvetica-Bold",
+            'InvTitle', parent=styles['Heading1'],
+            fontSize=26, textColor=C_PRIMARY, spaceAfter=4,
+            alignment=TA_CENTER, fontName='Helvetica-Bold',
         )
-        heading_style = ParagraphStyle(
-            "InvigHeading",
-            parent=styles["Heading2"],
-            fontSize=14,
-            textColor=colors.HexColor("#4a5568"),
-            spaceAfter=8,
-            spaceBefore=4,
-            fontName="Helvetica-Bold",
+        subtitle_style = ParagraphStyle(
+            'InvSub', parent=styles['Normal'],
+            fontSize=10, textColor=C_MUTED, spaceAfter=18,
+            alignment=TA_CENTER, fontName='Helvetica',
         )
-        story.append(Paragraph(data.get("title", "Invigilator Activity Report"), title_style))
-        story.append(Spacer(1, 0.15 * inch))
+        section_style = ParagraphStyle(
+            'InvSec', parent=styles['Heading2'],
+            fontSize=13, textColor=C_PRIMARY, spaceAfter=6,
+            spaceBefore=16, fontName='Helvetica-Bold',
+        )
+        cell_style = ParagraphStyle(
+            'InvCell', parent=styles['Normal'],
+            fontName='Helvetica', fontSize=8, leading=12,
+            alignment=TA_LEFT, wordWrap='LTR',
+        )
+        cell_bold = ParagraphStyle(
+            'InvCellB', parent=cell_style, fontName='Helvetica-Bold',
+        )
+        header_cell_style = ParagraphStyle(
+            'InvHdr', parent=styles['Normal'],
+            fontName='Helvetica-Bold', fontSize=8, leading=12,
+            alignment=TA_LEFT, textColor=colors.white, wordWrap='LTR',
+        )
+
+        def _section_heading(text: str) -> list:
+            elems = [
+                Spacer(1, 0.15 * inch),
+                Paragraph(text, section_style),
+            ]
+            rule = Table([['']], colWidths=[_usable_w])
+            rule.setStyle(TableStyle([
+                ('LINEBELOW', (0, 0), (-1, 0), 1.5, C_PRIMARY),
+                ('TOPPADDING', (0, 0), (-1, 0), 0),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 0),
+            ]))
+            elems.append(rule)
+            elems.append(Spacer(1, 0.1 * inch))
+            return elems
+
+        # ── Title ─────────────────────────────────────────────────────────────
+        story.append(Paragraph(_report_title, title_style))
         summary = data.get("summary") or {}
-        meta_rows = [
-            ["Generated:", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")],
-            ["Rows:", str(summary.get("total_activities", 0))],
-            ["Report mode:", str(data.get("report_mode", "N/A"))],
+        sub_parts = [
+            f"Mode: {str(data.get('report_mode', '')).title()}",
+            f"Rows: {summary.get('total_activities', 0)}",
+            f"Generated: {_gen_ts}",
         ]
-        meta_table = Table(meta_rows, colWidths=[1.8 * inch, 8.2 * inch])
-        meta_table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f7fafc")),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                    ("FONTSIZE", (0, 0), (-1, -1), 9),
-                ]
-            )
-        )
-        story.append(meta_table)
-        story.append(Spacer(1, 0.2 * inch))
+        story.append(Paragraph('  ·  '.join(sub_parts), subtitle_style))
+
+        # ── Activity table ─────────────────────────────────────────────────────
         rows_data = data.get("invigilator_activities") or []
         if not rows_data:
-            story.append(Paragraph("No invigilator activities matched the selected filters.", styles["Normal"]))
+            story.append(Spacer(1, 0.3 * inch))
+            story.append(Paragraph(
+                "No invigilator activities matched the selected filters.",
+                ParagraphStyle('NoData', parent=styles['Normal'], textColor=C_MUTED, fontSize=10),
+            ))
         else:
-            story.append(Paragraph("Activities (object-storage frame per row)", heading_style))
-            story.append(Spacer(1, 0.06 * inch))
-            pdf_cell_style = ParagraphStyle(
-                "InvigPdfCell",
-                parent=styles["Normal"],
-                fontName="Helvetica",
-                fontSize=6,
-                leading=9,
-                alignment=TA_LEFT,
-                wordWrap="LTR",
-            )
-            pdf_header_style = ParagraphStyle(
-                "InvigPdfHdr",
-                parent=styles["Normal"],
-                fontName="Helvetica-Bold",
-                fontSize=6,
-                leading=9,
-                alignment=TA_LEFT,
-                textColor=colors.whitesmoke,
-                wordWrap="LTR",
-            )
+            story.extend(_section_heading("Invigilator Activities"))
+
+            # Time | Invigilator | Activity | Severity | Exam | Room | Evidence
             _inv_cw = [
-                _usable_w_pt * 0.09,
-                _usable_w_pt * 0.11,
-                _usable_w_pt * 0.17,
-                _usable_w_pt * 0.07,
-                _usable_w_pt * 0.11,
-                _usable_w_pt * 0.07,
-                _usable_w_pt * 0.38,
+                _usable_w * 0.09,
+                _usable_w * 0.13,
+                _usable_w * 0.18,
+                _usable_w * 0.09,
+                _usable_w * 0.13,
+                _usable_w * 0.08,
+                _usable_w * 0.30,
             ]
-            _row_pad_inv = TableStyle(
-                [
-                    ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 3),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-                    ("TOPPADDING", (0, 0), (-1, -1), 4),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ]
-            )
-            header_row = [
-                [
-                    _pdf_paragraph_cell("Time", pdf_header_style),
-                    _pdf_paragraph_cell("Invigilator", pdf_header_style),
-                    _pdf_paragraph_cell("Activity", pdf_header_style),
-                    _pdf_paragraph_cell("Severity", pdf_header_style),
-                    _pdf_paragraph_cell("Exam", pdf_header_style),
-                    _pdf_paragraph_cell("Room", pdf_header_style),
-                    _pdf_paragraph_cell("Evidence (R2)", pdf_header_style),
-                ]
-            ]
-            hdr_tbl = Table(header_row, colWidths=_inv_cw)
-            hs = TableStyle(list(_row_pad_inv.getCommands()))
-            hs.add("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#6e5ae6"))
-            hdr_tbl.setStyle(hs)
+            _base_ts = TableStyle([
+                ('ALIGN',         (0, 0), (-1, -1), 'LEFT'),
+                ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+                ('LEFTPADDING',   (0, 0), (-1, -1), 6),
+                ('RIGHTPADDING',  (0, 0), (-1, -1), 6),
+                ('TOPPADDING',    (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                ('LINEBELOW',     (0, 0), (-1, -1), 0.4, C_BORDER),
+            ])
+
+            hdr_data = [[
+                _pdf_paragraph_cell(h, header_cell_style)
+                for h in ('Time', 'Invigilator', 'Activity', 'Severity', 'Exam', 'Room', 'Evidence')
+            ]]
+            hdr_tbl = Table(hdr_data, colWidths=_inv_cw)
+            hdr_ts = TableStyle(list(_base_ts.getCommands()))
+            hdr_ts.add('BACKGROUND',    (0, 0), (-1, -1), C_PRIMARY)
+            hdr_ts.add('TOPPADDING',    (0, 0), (-1, -1), 8)
+            hdr_ts.add('BOTTOMPADDING', (0, 0), (-1, -1), 8)
+            hdr_tbl.setStyle(hdr_ts)
             story.append(hdr_tbl)
 
             for idx, r in enumerate(rows_data[:200]):
                 ev_url = str(r.get("report_evidence_url") or r.get("evidence_url") or "").strip()
-                if ev_url and not ev_url.startswith(("http://", "https://")):
-                    ev_cell = _pdf_paragraph_cell(ev_url[:120], pdf_cell_style, soft_wrap_chars=80)
+                if ev_url and ev_url.startswith(("http://", "https://")):
+                    ev_cell = _pdf_link_cell(ev_url, cell_style, display_text="View frame", soft_wrap_chars=52)
                 elif ev_url:
-                    ev_cell = _pdf_link_cell(
-                        ev_url,
-                        pdf_cell_style,
-                        display_text="open",
-                        soft_wrap_chars=52,
-                    )
+                    ev_cell = _pdf_paragraph_cell(ev_url[:120], cell_style, soft_wrap_chars=80)
                 else:
-                    ev_cell = _pdf_paragraph_cell("N/A", pdf_cell_style)
+                    ev_cell = _pdf_paragraph_cell("—", cell_style)
 
-                bg = colors.white if idx % 2 == 0 else colors.HexColor("#f7fafc")
-                row_tbl = Table(
-                    [
-                        [
-                            _pdf_paragraph_cell(str(r.get("timestamp", ""))[:19], pdf_cell_style),
-                            _pdf_paragraph_cell(
-                                str(r.get("invigilator_name", ""))[:42],
-                                pdf_cell_style,
-                                soft_wrap_chars=28,
-                            ),
-                            _pdf_paragraph_cell(
-                                str(r.get("activity_type", ""))[:56],
-                                pdf_cell_style,
-                                soft_wrap_chars=48,
-                            ),
-                            _pdf_paragraph_cell(str(r.get("severity", ""))[:14], pdf_cell_style),
-                            _pdf_paragraph_cell(
-                                str(r.get("exam_name", ""))[:40],
-                                pdf_cell_style,
-                                soft_wrap_chars=28,
-                            ),
-                            _pdf_paragraph_cell(str(r.get("room_label", ""))[:22], pdf_cell_style),
-                            ev_cell,
-                        ]
-                    ],
-                    colWidths=_inv_cw,
+                sev_raw = str(r.get("severity") or "").strip().lower()
+                sev_bg, sev_txt = SEV_COLORS.get(sev_raw, (C_BG_LIGHT, C_TEXT))
+                sev_label = sev_raw.title() if sev_raw else "—"
+                sev_badge_style = ParagraphStyle(
+                    f'ISev{idx}', parent=styles['Normal'],
+                    fontName='Helvetica-Bold', fontSize=7.5,
+                    textColor=sev_txt, alignment=TA_CENTER,
                 )
-                rs = TableStyle(list(_row_pad_inv.getCommands()))
-                rs.add("BACKGROUND", (0, 0), (-1, 0), bg)
-                row_tbl.setStyle(rs)
+
+                row_bg = C_PANEL if idx % 2 == 0 else C_STRIPE
+                ts_str = str(r.get("timestamp", ""))
+                time_display = ts_str[11:19] if len(ts_str) >= 19 else ts_str[:19]
+
+                row_data = [[
+                    _pdf_paragraph_cell(time_display, cell_style),
+                    _pdf_paragraph_cell(str(r.get("invigilator_name") or "—")[:42], cell_bold, soft_wrap_chars=28),
+                    _pdf_paragraph_cell(str(r.get("activity_type") or "—")[:56], cell_style, soft_wrap_chars=48),
+                    Paragraph(sev_label, sev_badge_style),
+                    _pdf_paragraph_cell(str(r.get("exam_name") or "—")[:40], cell_style, soft_wrap_chars=28),
+                    _pdf_paragraph_cell(str(r.get("room_label") or "—")[:22], cell_style),
+                    ev_cell,
+                ]]
+                row_tbl = Table(row_data, colWidths=_inv_cw)
+                row_ts = TableStyle(list(_base_ts.getCommands()))
+                row_ts.add('BACKGROUND', (0, 0), (-1, -1), row_bg)
+                row_ts.add('BACKGROUND', (3, 0), (3, 0), sev_bg)
+                row_tbl.setStyle(row_ts)
                 story.append(row_tbl)
 
             if len(rows_data) > 200:
-                story.append(
-                    Spacer(1, 0.08 * inch),
-                )
-                story.append(
-                    Paragraph(
-                        _xml_escape(f"… {len(rows_data) - 200} more rows not shown"),
-                        styles["Normal"],
-                    ),
-                )
-        story.append(Spacer(1, 0.3 * inch))
-        story.append(
-            Paragraph(
-                f"Generated by ForeSyte | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}",
-                styles["Normal"],
-            )
-        )
-        doc.build(story)
+                story.append(Spacer(1, 0.1 * inch))
+                story.append(Paragraph(
+                    _xml_escape(f"… {len(rows_data) - 200} more rows not shown in this PDF export."),
+                    ParagraphStyle('Trunc', parent=styles['Normal'], textColor=C_MUTED, fontSize=8),
+                ))
+
+        doc.build(story, onFirstPage=_on_page, onLaterPages=_on_page)
         logger.info("generate_invigilator_pdf_report: success, path=%s", full_path)
         return True
     except Exception as e:
