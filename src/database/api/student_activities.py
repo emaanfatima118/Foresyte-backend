@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from uuid import UUID
 from datetime import datetime
@@ -105,16 +105,31 @@ def create_student_activity(
 # READ All (Admin + Investigator)
 @router.get("/", response_model=List[StudentActivityRead])
 def get_all_student_activities(
+    exam_id: Optional[UUID] = Query(None, description="Filter by exam"),
+    student_id: Optional[UUID] = Query(None, description="Filter by student"),
+    severity: Optional[str] = Query(None, description="Filter by severity label"),
+    activity_type: Optional[str] = Query(None, description="Filter by activity type"),
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Admins and Investigators can view all student activities.
+    Optional query parameters filter the result set (aligned with client query string).
     """
     if current_user.get("user_type") not in ["admin", "investigator"]:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    rows = db.query(StudentActivity).all()
+    q = db.query(StudentActivity)
+    if exam_id is not None:
+        q = q.filter(StudentActivity.exam_id == exam_id)
+    if student_id is not None:
+        q = q.filter(StudentActivity.student_id == student_id)
+    if severity is not None and severity.strip():
+        q = q.filter(StudentActivity.severity == severity)
+    if activity_type is not None and activity_type.strip():
+        q = q.filter(StudentActivity.activity_type == activity_type)
+
+    rows = q.all()
     return [StudentActivityRead(**d) for d in enrich_activities(db, rows)]
 
 

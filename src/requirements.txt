@@ -13,3 +13,5 @@ SQLAlchemy==2.0.44
 starlette==0.48.0
 ultralytics==8.3.76
 uvicorn
+celery[redis]>=5.3.4
+redis>=5.0.0

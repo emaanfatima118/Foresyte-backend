@@ -35,9 +35,13 @@ import pandas as pd
 from datetime import datetime
 from collections import deque, defaultdict
 from ultralytics import YOLO
-import mediapipe as mp
 
 _log = logging.getLogger(__name__)
+
+# MediaPipe is only used here for *pose-based* activity (Sitting / Standing refinement).
+# Invigilator *phone* detection is YOLO + OpenCV heuristics in PhoneDetector — it never
+# used MediaPipe. Set True only if you want PoseLandmarker back for activity labels.
+_USE_INVIGILATOR_MEDIAPIPE_POSE = False
 
 # ╔══════════════════════════════════════════════════════════════╗
 #  CONFIGURATION
@@ -116,6 +120,18 @@ class ActivityClassifier:
         self.mp_draw = None
         self._pose_landmarker = None
         self._pose_backend = None  # "legacy" | "tasks" | None
+        self._mp = None  # mediapipe module reference when Tasks API is used
+
+        if not _USE_INVIGILATOR_MEDIAPIPE_POSE:
+            _log.info(
+                "MediaPipe pose disabled (invigilator). Activity uses bbox heuristics only; "
+                "phone detection unchanged (YOLO + OpenCV in PhoneDetector)."
+            )
+            return
+
+        import mediapipe as mp
+
+        self._mp = mp
 
         if hasattr(mp, "solutions"):
             try:
@@ -237,7 +253,9 @@ class ActivityClassifier:
     def _run_mediapipe_tasks(self, crop_bgr):
         img = self._upscale(crop_bgr)
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        mp_image = self._mp.Image(
+            image_format=self._mp.ImageFormat.SRGB, data=rgb
+        )
         result = self._pose_landmarker.detect(mp_image)
         debug = img.copy()
 

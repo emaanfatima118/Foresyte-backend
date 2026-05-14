@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -106,19 +107,22 @@ class ForesyteDetectConfig:
         return cls()
 
 
-_model_cache: object | None = None
-_model_path_loaded: str | None = None
+# Per-thread model cache: parallel frame analysis uses several threads; a single global
+# model races on first load and Ultralytics predict is not assumed thread-safe across workers.
+_thread_local = threading.local()
 
 
 def _get_model(cfg: ForesyteDetectConfig):
-    global _model_cache, _model_path_loaded
     resolved = _resolve_model_path(cfg.model_path)
-    if _model_cache is None or _model_path_loaded != resolved:
+    cache: dict[str, object] | None = getattr(_thread_local, "foresyte_behaviour", None)
+    if cache is None:
+        cache = {}
+        _thread_local.foresyte_behaviour = cache
+    if resolved not in cache:
         mod = _load_detect_module()
         log.info("Loading ForeSyte behaviour model: %s", resolved)
-        _model_cache = mod.load_model(resolved)
-        _model_path_loaded = resolved
-    return _model_cache
+        cache[resolved] = mod.load_model(resolved)
+    return cache[resolved]
 
 
 def run_foresyte_on_image(
@@ -152,14 +156,21 @@ def run_foresyte_on_image(
         cfg.tile,
     )
 
-    suspicious = mod.SUSPICIOUS
+    suspicious_set = getattr(mod, "SUSPICIOUS", frozenset())
+    suspect_fold = getattr(mod, "is_suspicious_label", None)
+    fold_set = getattr(mod, "_SUSPECT_FOLD", None)
     results: list[ClassificationResult] = []
     for i, d in enumerate(dets, start=1):
         box = d["box"]
         x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
         label = d["class_name"]
         score = float(d["score"])
-        susp = label in suspicious
+        if callable(suspect_fold):
+            susp = bool(suspect_fold(str(label)))
+        elif isinstance(fold_set, set):
+            susp = str(label).casefold() in fold_set
+        else:
+            susp = label in suspicious_set
         results.append(
             ClassificationResult(
                 bbox=(x1, y1, x2, y2),

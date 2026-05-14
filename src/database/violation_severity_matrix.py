@@ -32,7 +32,14 @@ CURATED_SEVERITY_MATRIX: Dict[str, List[Tuple[int, str]]] = {
     "Hand Under Table; Look Around": [(1, "medium"), (3, "high"), (8, "critical")],
     "Hand Under Table; Bend Over The Desk": [(1, "medium"), (3, "high"), (8, "critical")],
     "Hand Under Table; Stand Up": [(1, "high"), (4, "critical")],
-    # Triples
+    "Hand Under Table; Wave": [(1, "medium"), (3, "high"), (8, "critical")],
+    "Hand Under Table; Hand Under Table": [(1, "medium"), (3, "high"), (8, "critical")],
+    "Hand Under Table; Hand Under Table; Look Around": [(1, "medium"), (3, "high"), (8, "critical")],
+    "Hand Under Table; Hand Under Table; Bend Over The Desk": [(1, "medium"), (3, "high"), (8, "critical")],
+    "Hand Under Table; Hand Under Table; Stand Up": [(1, "high"), (4, "critical")],
+    "Hand Under Table; Hand Under Table; Wave": [(1, "medium"), (3, "high"), (8, "critical")],
+    # Triple: Hand Under Table + Look Around + Bend Over The Desk (canonical merge order)
+    "Hand Under Table; Bend Over The Desk; Look Around": [(1, "high"), (2, "critical")],
     "phone; Hand Under Table; Look Around": [(1, "high"), (2, "critical")],
     "phone; Hand Under Table; Bend Over The Desk": [(1, "high"), (2, "critical")],
     "phone; Hand Under Table; Stand Up": [(1, "high"), (2, "critical")],

@@ -5,9 +5,10 @@ Handles both live CCTV feeds and uploaded exam recordings
 
 import cv2
 import os
-from datetime import datetime
-from typing import Optional, Dict, Any
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any, List, Tuple
 import asyncio
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 import logging
 import json
@@ -16,6 +17,60 @@ from .frame_overlay_timestamp import parse_exam_timestamp_from_frame
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# JPEG save params: lower quality → smaller writes, faster disk I/O (still fine for ML).
+def _frame_jpeg_write_params() -> list:
+    q = max(60, min(100, int(os.getenv("FRAME_JPEG_QUALITY", "88"))))
+    return [int(cv2.IMWRITE_JPEG_QUALITY), q]
+
+
+def _exam_ts_ocr_stride() -> int:
+    """Run overlay OCR every N extracted frames (1 = legacy; larger = much faster extraction)."""
+    try:
+        n = int(os.getenv("EXAM_TS_OCR_EVERY_N_EXTRACTED", "30"))
+    except ValueError:
+        n = 30
+    return max(1, n)
+
+
+def _use_fast_grab_between_samples() -> bool:
+    """grab() skips full decode between sampled frames — disable if decode issues on odd codecs."""
+    return os.getenv("VIDEO_EXTRACT_FAST_SKIP", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _recorded_sampling_stride(video_fps: float) -> tuple[int, float]:
+    """
+    How many decoded frames between saved extracts (~ samples/sec = fps / stride).
+
+    ``RECORDED_TARGET_SAMPLE_HZ`` (default ``1``) = nominal extracts per video second.
+    Set to ``0.5`` to extract ~every 2s (fewer AI passes, faster). Caps at native fps.
+
+    Deprecated alias: ``RECORDED_SAMPLES_PER_SECOND`` (same meaning).
+    """
+    fv = float(video_fps if video_fps and video_fps > 1e-3 else 30.0)
+    raw = (os.getenv("RECORDED_TARGET_SAMPLE_HZ") or os.getenv(
+        "RECORDED_SAMPLES_PER_SECOND", "1"
+    )).strip()
+    try:
+        hz = float(raw)
+    except ValueError:
+        hz = 1.0
+    hz = max(1.0 / 12.0, min(hz, fv))
+    stride = max(1, int(round(fv / hz)))
+    approx_hz = fv / stride
+    return stride, approx_hz
+
+
+def _seconds_between_extracted_frames(video_fps: float, frame_interval: int) -> float:
+    """Video-timeline seconds between two consecutive sampled frames (= frame_interval / fps)."""
+    fv = video_fps if video_fps and video_fps > 1e-3 else 30.0
+    return float(max(1, int(frame_interval))) / fv
+
 
 # Per video upload / job: uploads/frames/<job_id>/simple/  (raw extracts)
 #                         uploads/frames/<job_id>/pipeline/  (after AI pipeline)
@@ -40,6 +95,144 @@ def ensure_session_frame_dirs_under(
     simple.mkdir(parents=True, exist_ok=True)
     pipeline.mkdir(parents=True, exist_ok=True)
     return simple, pipeline
+
+
+def _video_extract_mp_workers() -> int:
+    """Extract processes for CPU-bound decode/encode; 1 = legacy single-process path."""
+    try:
+        n = int(os.getenv("VIDEO_EXTRACT_MP_WORKERS", "1"))
+    except ValueError:
+        n = 1
+    return max(1, n)
+
+
+def _split_extract_index_ranges(extract_total: int, parts: int) -> List[Tuple[int, int]]:
+    """Split [0, extract_total) into ``parts`` half-open ranges (start inclusive, end exclusive)."""
+    extract_total = max(0, int(extract_total))
+    parts = max(1, int(parts))
+    if extract_total == 0:
+        return [(0, 0)]
+    parts = min(parts, extract_total)
+    base = extract_total // parts
+    rem = extract_total % parts
+    out: List[Tuple[int, int]] = []
+    cur = 0
+    for i in range(parts):
+        extra = 1 if i < rem else 0
+        nxt = cur + base + extra
+        out.append((cur, nxt))
+        cur = nxt
+    return out
+
+
+def _parse_anchor_iso(iso_val: Optional[str]) -> Optional[datetime]:
+    if not iso_val:
+        return None
+    s = iso_val.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _mp_extract_chunk(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Picklable worker: extract frames for extract-indices [e_start, e_end).
+    Logical frame index ``e`` maps to CAP frame ``e * frame_rate`` when sampling every ``frame_rate`` frames from 0.
+    """
+    video_path = payload["video_path"]
+    simple_dir = Path(payload["simple_dir"])
+    job_id = payload["job_id"]
+    frame_rate = max(1, int(payload["frame_rate"]))
+    e_start = int(payload["e_start"])
+    e_end = int(payload["e_end"])
+    total_frames = int(payload["total_frames"])
+    fps_raw = float(payload.get("fps_raw") or 30.0)
+    ocr_stride = max(1, int(payload.get("ocr_stride") or 30))
+    jpeg_params = list(payload["jpeg_params"])
+    run_ocr = bool(payload.get("run_ocr"))
+    passed_anchor_iso = payload.get("passed_anchor_iso")
+    passed_anchor_idx = payload.get("passed_anchor_idx")
+    if passed_anchor_idx is not None:
+        passed_anchor_idx = int(passed_anchor_idx)
+
+    passed_anchor_dt = _parse_anchor_iso(passed_anchor_iso)
+    anchor_exam_dt: Optional[datetime] = passed_anchor_dt
+    anchor_extract_idx: Optional[int] = passed_anchor_idx
+
+    sec_per_extract = timedelta(
+        seconds=_seconds_between_extracted_frames(fps_raw, frame_rate)
+    )
+    frames_info: list = []
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logger.error("MP extract: cannot open %s", video_path)
+        return {"frames": frames_info, "anchor_exam_dt": None, "anchor_extract_idx": None}
+
+    try:
+        for e in range(e_start, e_end):
+            phy_fn = e * frame_rate
+            if phy_fn >= total_frames:
+                break
+            cap.set(cv2.CAP_PROP_POS_FRAMES, phy_fn)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                logger.warning("MP extract: read failed at logical e=%s phy=%s", e, phy_fn)
+                continue
+
+            exam_ts = None
+            if run_ocr and (e % ocr_stride == 0):
+                try:
+                    exam_ts = parse_exam_timestamp_from_frame(frame)
+                except Exception as _ocr_exc:
+                    logger.warning("MP extract OCR error at e=%s: %s", e, _ocr_exc)
+
+            if exam_ts is not None:
+                anchor_exam_dt = exam_ts
+                anchor_extract_idx = e
+                timestamp = exam_ts
+            elif anchor_exam_dt is not None and anchor_extract_idx is not None:
+                timestamp = anchor_exam_dt + sec_per_extract * (e - anchor_extract_idx)
+            else:
+                timestamp = datetime.utcnow()
+                if run_ocr and (e % ocr_stride == 0):
+                    logger.debug(
+                        "MP extract: no anchor at e=%s — using UTC processing time",
+                        e,
+                    )
+
+            frame_filename = (
+                f"frame_{job_id}_{phy_fn}_"
+                f"{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
+            )
+            frame_path = simple_dir / frame_filename
+            cv2.imwrite(str(frame_path), frame, jpeg_params)
+
+            frames_info.append(
+                {
+                    "frame_number": phy_fn,
+                    "timestamp": timestamp,
+                    "frame_path": str(frame_path),
+                    "extracted": True,
+                    "annotated": False,
+                }
+            )
+    finally:
+        cap.release()
+
+    anchor_out = None
+    anchor_idx_out = None
+    if anchor_exam_dt is not None and anchor_extract_idx is not None:
+        anchor_out = anchor_exam_dt.isoformat()
+        anchor_idx_out = anchor_extract_idx
+
+    return {
+        "frames": frames_info,
+        "anchor_exam_dt": anchor_out,
+        "anchor_extract_idx": anchor_idx_out,
+    }
 
 
 class VideoStreamHandler:
@@ -240,7 +433,13 @@ class VideoStreamHandler:
         """
         Extracts frames from video for analysis.
         Used in Step 3 of UC-07: Process video frames
-        
+
+        Performance (see env vars):
+        ``EXAM_TS_OCR_EVERY_N_EXTRACTED`` (default 30) — OCR is expensive; timestamps between
+        runs are interpolated from the overlay clock. Set to ``1`` for legacy per-frame OCR.
+        ``VIDEO_EXTRACT_FAST_SKIP`` — when ``1`` (default), use ``grab()`` between samples.
+        ``FRAME_JPEG_QUALITY`` (default 88) — JPEG quality for extracted files.
+
         Args:
             video_source: Path to video file or stream URL
             frame_rate: Extract 1 frame per N frames (default: 1 = every frame)
@@ -269,59 +468,115 @@ class VideoStreamHandler:
         
         frame_number = 0
         extracted_count = 0
-        
+        ocr_stride = _exam_ts_ocr_stride()
+        jpeg_params = _frame_jpeg_write_params()
+
+        fps_raw = float(cap.get(cv2.CAP_PROP_FPS))
+        sec_per_extract = timedelta(
+            seconds=_seconds_between_extracted_frames(fps_raw, frame_rate)
+        )
+
+        anchor_exam_dt: Optional[datetime] = None
+        anchor_extract_idx: Optional[int] = None
+
+        fast_grab_skip = (
+            frame_rate > 1
+            and _use_fast_grab_between_samples()
+        )
+
         # Get total frame count for progress tracking
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         # Calculate expected number of extracted frames
         expected_extracted_frames = (total_frames // frame_rate) + (1 if total_frames % frame_rate > 0 else 0)
-        logger.info(f"Video has {total_frames} total frames, extracting every {frame_rate} frames (expected: ~{expected_extracted_frames} frames)")
-        
+        logger.info(
+            "Video has %s total frames, extracting every %s frames (expected: ~%s); "
+            "OCR every %s extracted frame(s); JPEG params %s",
+            total_frames,
+            frame_rate,
+            expected_extracted_frames,
+            ocr_stride,
+            jpeg_params,
+        )
+
         try:
             while True:
+                if fast_grab_skip and frame_number % frame_rate != 0:
+                    if not cap.grab():
+                        break
+                    frame_number += 1
+                    continue
+
+                if not fast_grab_skip and frame_number % frame_rate != 0:
+                    ret, _ = cap.read()
+                    if not ret:
+                        break
+                    frame_number += 1
+                    continue
+
                 ret, frame = cap.read()
-                
                 if not ret:
                     break
-                
-                # Extract frame based on frame_rate
-                if frame_number % frame_rate == 0:
-                    exam_ts = None
+
+                exam_ts = None
+                run_ocr = extracted_count % ocr_stride == 0
+                if run_ocr:
                     try:
                         exam_ts = parse_exam_timestamp_from_frame(frame)
                     except Exception as _ocr_exc:
                         logger.warning("Exam overlay timestamp OCR error: %s", _ocr_exc)
-                    timestamp = exam_ts if exam_ts is not None else datetime.utcnow()
-                    if exam_ts is None:
+
+                if exam_ts is not None:
+                    anchor_exam_dt = exam_ts
+                    anchor_extract_idx = extracted_count
+                    timestamp = exam_ts
+                elif anchor_exam_dt is not None and anchor_extract_idx is not None:
+                    timestamp = anchor_exam_dt + sec_per_extract * (
+                        extracted_count - anchor_extract_idx
+                    )
+                    logger.debug(
+                        "Frame %s: timestamp interpolated from OCR anchor (extract #%s)",
+                        frame_number,
+                        extracted_count,
+                    )
+                else:
+                    timestamp = datetime.utcnow()
+                    if run_ocr:
                         logger.debug(
-                            "Frame %s: using processing time as timestamp (OCR disabled or failed)",
+                            "Frame %s: no OCR anchor yet — UTC processing time",
                             frame_number,
                         )
-                    frame_filename = f"frame_{job_id}_{frame_number}_{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
-                    frame_path = simple_dir / frame_filename
-                    # Raw CCTV only — no seating-plan overlay (cleaner input for cheating detection)
-                    cv2.imwrite(str(frame_path), frame)
-                    
-                    frames_info.append({
-                        "frame_number": frame_number,
-                        "timestamp": timestamp,
-                        "frame_path": str(frame_path),
-                        "extracted": True,
-                        "annotated": False,
-                    })
-                    
-                    extracted_count += 1
-                    
-                    # Call progress callback if provided (every frame or at milestones)
-                    if progress_callback:
-                        try:
-                            # Use expected extracted frames for progress, not total video frames
-                            progress_callback(extracted_count, expected_extracted_frames)
-                        except Exception as e:
-                            logger.warning(f"Progress callback error: {e}")
-                    
-                    if extracted_count % 100 == 0:
-                        logger.info(f"Extracted {extracted_count} frames from job {job_id} (out of ~{total_frames // frame_rate} expected)")
-                
+
+                frame_filename = (
+                    f"frame_{job_id}_{frame_number}_"
+                    f"{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
+                )
+                frame_path = simple_dir / frame_filename
+                cv2.imwrite(str(frame_path), frame, jpeg_params)
+
+                frames_info.append({
+                    "frame_number": frame_number,
+                    "timestamp": timestamp,
+                    "frame_path": str(frame_path),
+                    "extracted": True,
+                    "annotated": False,
+                })
+
+                extracted_count += 1
+
+                if progress_callback:
+                    try:
+                        progress_callback(extracted_count, expected_extracted_frames)
+                    except Exception as e:
+                        logger.warning(f"Progress callback error: {e}")
+
+                if extracted_count % 100 == 0:
+                    logger.info(
+                        "Extracted %s frames from job %s (out of ~%s expected)",
+                        extracted_count,
+                        job_id,
+                        total_frames // frame_rate,
+                    )
+
                 frame_number += 1
                 
         except Exception as e:
@@ -331,7 +586,107 @@ class VideoStreamHandler:
             
         logger.info(f"Total frames extracted: {extracted_count} from {frame_number} total frames")
         return frames_info
-    
+
+    def extract_frames_parallel(
+        self,
+        video_source: str,
+        frame_rate: int,
+        job_id: str,
+        progress_callback,
+        total_frames: int,
+        num_workers: int,
+        room_id: Optional[str] = None,
+        db_session=None,
+    ) -> list:
+        """
+        CPU-bound extraction using multiple processes (OpenCV seek + JPEG encode per chunk).
+        Chunk 0 runs OCR for exam timestamps; later chunks interpolate from that anchor.
+
+        Set ``VIDEO_EXTRACT_MP_WORKERS`` > 1 to enable. Some codecs seek poorly; set to 1 if artifacts appear.
+        """
+        simple_dir, _pipeline_dir = self.ensure_session_frame_dirs(job_id)
+        frame_rate = max(1, int(frame_rate))
+        expected_extracted = (total_frames // frame_rate) + (
+            1 if total_frames % frame_rate > 0 else 0
+        )
+        num_workers = max(1, min(int(num_workers), expected_extracted))
+        ranges = _split_extract_index_ranges(expected_extracted, num_workers)
+
+        cap_probe = cv2.VideoCapture(video_source)
+        fps_raw = float(cap_probe.get(cv2.CAP_PROP_FPS)) if cap_probe.isOpened() else 30.0
+        cap_probe.release()
+
+        ocr_stride = _exam_ts_ocr_stride()
+        jpeg_params = _frame_jpeg_write_params()
+        base_payload: Dict[str, Any] = {
+            "video_path": video_source,
+            "simple_dir": str(simple_dir.resolve()),
+            "job_id": job_id,
+            "frame_rate": frame_rate,
+            "total_frames": total_frames,
+            "fps_raw": fps_raw,
+            "ocr_stride": ocr_stride,
+            "jpeg_params": jpeg_params,
+        }
+
+        # Phase 1 — establish OCR anchor (same semantics as single-process extract_frames)
+        e0, e1 = ranges[0]
+        first = _mp_extract_chunk(
+            {
+                **base_payload,
+                "e_start": e0,
+                "e_end": e1,
+                "run_ocr": True,
+                "passed_anchor_iso": None,
+                "passed_anchor_idx": None,
+            }
+        )
+        all_frames: list = list(first["frames"])
+        anchor_iso = first.get("anchor_exam_dt")
+        anchor_idx = first.get("anchor_extract_idx")
+        done = len(all_frames)
+        if progress_callback:
+            try:
+                progress_callback(min(done, expected_extracted), expected_extracted)
+            except Exception as e:
+                logger.warning("Progress callback error (parallel extract): %s", e)
+
+        if len(ranges) == 1:
+            return sorted(all_frames, key=lambda x: x["frame_number"])
+
+        # Phase 2 — remaining extract-index ranges in parallel
+        max_pool = max(1, min(len(ranges) - 1, (os.cpu_count() or 4)))
+        with ProcessPoolExecutor(max_workers=max_pool) as pool:
+            futs = []
+            for e_start, e_end in ranges[1:]:
+                payload = {
+                    **base_payload,
+                    "e_start": e_start,
+                    "e_end": e_end,
+                    "run_ocr": False,
+                    "passed_anchor_iso": anchor_iso,
+                    "passed_anchor_idx": anchor_idx,
+                }
+                futs.append(pool.submit(_mp_extract_chunk, payload))
+            for fut in as_completed(futs):
+                block = fut.result()
+                all_frames.extend(block["frames"])
+                done += len(block["frames"])
+                if progress_callback:
+                    try:
+                        progress_callback(min(done, expected_extracted), expected_extracted)
+                    except Exception as e:
+                        logger.warning("Progress callback error (parallel extract): %s", e)
+
+        all_frames.sort(key=lambda x: x["frame_number"])
+        logger.info(
+            "Parallel extract: %s frames across %s workers (expected ~%s)",
+            len(all_frames),
+            num_workers,
+            expected_extracted,
+        )
+        return all_frames
+
     async def process_live_stream(self, stream_url: str, duration_seconds: int = 3600,
                                   callback=None) -> Dict[str, Any]:
         """
@@ -439,9 +794,14 @@ class VideoStreamHandler:
         
         logger.info(f"Processing recorded video: {video_path}")
         logger.info(f"Total frames: {total_frames}, FPS: {fps}")
-        
-        # Extract 1 frame per second: take every Nth frame where N = fps
-        frame_extraction_rate = max(1, int(fps))
+
+        frame_extraction_rate, eff_hz = _recorded_sampling_stride(fps)
+        logger.info(
+            "Recorded frame stride=%s (~%.3f extracts/s of video); "
+            "tune RECORDED_TARGET_SAMPLE_HZ (default 1.0)",
+            frame_extraction_rate,
+            eff_hz,
+        )
         
         # Calculate expected extracted frames
         expected_extracted = (total_frames // frame_extraction_rate) + (1 if total_frames % frame_extraction_rate > 0 else 0)
@@ -452,9 +812,35 @@ class VideoStreamHandler:
                 progress_callback(0, expected_extracted)
             except Exception as e:
                 logger.warning(f"Progress callback error at start: {e}")
-        
-        frames = self.extract_frames(video_path, frame_extraction_rate, job_id, progress_callback, 
-                                    room_id=room_id, db_session=db_session)
+
+        mpw = _video_extract_mp_workers()
+        cpu_n = os.cpu_count() or 4
+        if mpw > 1:
+            mpw = min(mpw, cpu_n, max(1, expected_extracted))
+        if mpw > 1 and expected_extracted >= mpw:
+            logger.info(
+                "Using multiprocessing frame extraction (%s workers, VIDEO_EXTRACT_MP_WORKERS)",
+                mpw,
+            )
+            frames = self.extract_frames_parallel(
+                video_path,
+                frame_extraction_rate,
+                job_id,
+                progress_callback,
+                total_frames,
+                mpw,
+                room_id=room_id,
+                db_session=db_session,
+            )
+        else:
+            frames = self.extract_frames(
+                video_path,
+                frame_extraction_rate,
+                job_id,
+                progress_callback,
+                room_id=room_id,
+                db_session=db_session,
+            )
         
         # Final progress update
         if progress_callback:

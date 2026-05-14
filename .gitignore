@@ -343,6 +343,7 @@ src/uploads/reports/
 !src/uploads/.gitkeep
 !src/uploads/videos/.gitkeep
 !src/uploads/frames/.gitkeep
+!src/uploads/frames/detect.py
 !src/uploads/reports/.gitkeep
 
 # Additional environment variable paths

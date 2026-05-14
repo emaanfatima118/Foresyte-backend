@@ -2,7 +2,7 @@
 Invigilator Frame Adapter
 =========================
 Stateful per-stream adapter that wraps the invigilator detection pipeline
-(YOLO + ByteTrack + MediaPipe Pose + phone detector) and returns structured
+(YOLO + ByteTrack + optional MediaPipe pose + YOLO/OpenCV phone detector) and returns structured
 behaviour dicts compatible with VideoProcessor.
 
 Usage
@@ -72,7 +72,7 @@ def _severity_from_alert_key(alert_key: str) -> str:
 def _load_monitor_components():
     """
     Import the heavy components from invig_monitor lazily so that modules
-    that merely import this file don't trigger YOLO / MediaPipe loading.
+    that merely import this file don't trigger YOLO loading (MediaPipe is off by default in invig_monitor).
     """
     from app.invigilator.invig_monitor import (  # noqa: PLC0415
         ActivityClassifier,
@@ -107,7 +107,7 @@ def _load_monitor_components():
 # ---------------------------------------------------------------------------
 class InvigFrameAdapter:
     """
-    Stateful per-stream wrapper around the invigilator YOLO+MediaPipe pipeline.
+    Stateful per-stream wrapper around the invigilator YOLO pipeline (pose via MediaPipe optional).
 
     Only call process_frame() on frames that belong to the *same* video stream
     so that tracker IDs and per-person counters remain consistent.
@@ -123,7 +123,7 @@ class InvigFrameAdapter:
     FileNotFoundError
         If the YOLO model weights file is not found at the given path.
     ImportError
-        If required dependencies (ultralytics, mediapipe) are not installed.
+        If required dependencies (ultralytics) are not installed, or invigilator weights are missing.
     """
 
     def __init__(self, model_path: str | None = None) -> None:

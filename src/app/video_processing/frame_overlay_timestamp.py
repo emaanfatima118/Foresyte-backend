@@ -4,6 +4,10 @@ Read exam date/time burned into CCTV frames (top-left overlay) using Tesseract O
 Requires the ``tesseract`` binary on PATH (https://github.com/tesseract-ocr/tesseract).
 Python package: ``pytesseract``. Disable with env ``EXAM_TIMESTAMP_OCR=0``.
 
+During batch extraction (``video_processing.stream_handler``), OCR runs every
+``EXAM_TS_OCR_EVERY_N_EXTRACTED`` extracted frames (default ``30``) for speed.
+Timestamps between runs are interpolated from the last parsed overlay clock.
+
 Crop defaults target a typical top-left stamp like: ``11-25-2025 Tue 16:02:24``.
 """
 
