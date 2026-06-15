@@ -72,7 +72,8 @@ class TestCompositeMinFrames(unittest.TestCase):
 
 
 class TestRunBoundaries(unittest.TestCase):
-    def test_merged_string_changes_start_new_run(self):
+    def test_phone_and_phone_look_around_merge_one_continuity_run(self):
+        """Dominant continuity key is phone_device for both merged and pure phone."""
         m1 = merge_behavior_labels(["phone"])
         m2 = merge_behavior_labels(["phone", "Look Around"])
         dets = [
@@ -88,7 +89,20 @@ class TestRunBoundaries(unittest.TestCase):
             },
         ]
         runs = get_runs_from_detections(dets)
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].frame_count, 2)
+        self.assertIn("phone", runs[0].label_raw)
+        self.assertIn("Look Around", runs[0].label_raw)
+
+    def test_large_timestamp_gap_splits_run(self):
+        dets = [
+            {"timestamp": "2025-01-01T00:00:00", "frame_number": 1, "behavior_type": "phone"},
+            {"timestamp": "2025-01-01T00:10:00", "frame_number": 2, "behavior_type": "phone"},
+        ]
+        runs = get_runs_from_detections(dets)
         self.assertEqual(len(runs), 2)
+        self.assertEqual(runs[0].frame_count, 1)
+        self.assertEqual(runs[1].frame_count, 1)
 
     def test_same_merged_string_one_run(self):
         m = merge_behavior_labels(["phone", "Wave"])

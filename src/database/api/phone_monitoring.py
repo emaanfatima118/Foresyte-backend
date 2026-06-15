@@ -38,10 +38,11 @@ active_monitoring: Dict[str, PhoneFeedProcessor] = {}
 
 class StartMonitoringRequest(BaseModel):
     stream_url: str
-    exam_id: Optional[str] = None
-    room_id: Optional[str] = None
+    exam_id: str
+    room_id: str
     duration_seconds: int = 3600
     process_every_n_frames: int = 30
+    enable_ai: Optional[bool] = None
 
 class StartMonitoringResponse(BaseModel):
     session_id: str
@@ -74,7 +75,23 @@ async def start_phone_monitoring(
     """
     if current_user.get("user_type") not in ["admin", "investigator", "invigilator"]:
         raise HTTPException(status_code=403, detail="Access denied")
-    
+
+    raw_exam = (request.exam_id or "").strip()
+    raw_room = (request.room_id or "").strip()
+    if not raw_exam or not raw_room:
+        raise HTTPException(
+            status_code=400,
+            detail="exam_id and room_id are required (same as video upload).",
+        )
+    try:
+        exam_uuid = UUID(raw_exam)
+        room_uuid = UUID(raw_room)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail="exam_id and room_id must be valid UUIDs.",
+        ) from e
+
     # Check if there's already an active monitoring session
     if active_monitoring:
         # Stop existing session
@@ -86,12 +103,16 @@ async def start_phone_monitoring(
     session_id = str(uuid4())
     
     # Create processor
-    processor = PhoneFeedProcessor(db_session=db, enable_ai=False, save_frames=True)
+    processor = PhoneFeedProcessor(
+        db_session=db,
+        enable_ai=request.enable_ai,
+        save_frames=True,
+    )
     
     # Start processing in background
     stream_id = f"phone-{session_id}"
-    exam_id = request.exam_id or "default-exam"
-    room_id = request.room_id or "default-room"
+    exam_id = str(exam_uuid)
+    room_id = str(room_uuid)
     
     # Store processor in active monitoring
     active_monitoring[session_id] = processor
@@ -106,7 +127,7 @@ async def start_phone_monitoring(
         exam_id=exam_id,
         room_id=room_id,
         duration_seconds=request.duration_seconds,
-        process_every_n_frames=request.process_every_n_frames
+        process_every_n_frames=request.process_every_n_frames,
     )
     
     return StartMonitoringResponse(

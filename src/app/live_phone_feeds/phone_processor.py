@@ -5,6 +5,7 @@ Processes live video feeds from phones using the existing VideoProcessor
 
 import asyncio
 import logging
+import os
 from typing import Dict, Any, Optional
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +17,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.live_phone_feeds.phone_stream_receiver import PhoneStreamReceiver
-from app.video_processing.processor import VideoProcessor
+from app.video_processing.processor import VideoProcessor, LiveFootageAccumState
 from app.video_processing.stream_handler import ensure_session_frame_dirs_under
 
 logging.basicConfig(level=logging.INFO)
@@ -29,18 +30,27 @@ class PhoneFeedProcessor:
     Integrates with existing VideoProcessor for analysis.
     """
     
-    def __init__(self, db_session=None, enable_ai=False, save_frames=True, frame_dir="uploads/frames"):
+    def __init__(self, db_session=None, enable_ai: Optional[bool] = None, save_frames=True, frame_dir="uploads/frames"):
         """
         Initialize phone feed processor.
-        
+
         Args:
             db_session: Database session (optional)
-            enable_ai: Enable AI detection (default: False)
+            enable_ai: Run student + invigilator pipeline on sampled frames (default: env
+                PHONE_MONITORING_ENABLE_AI, or True).
             save_frames: Save frames to disk (default: True)
             frame_dir: Directory to save frames (default: "uploads/frames")
         """
         self.receiver = PhoneStreamReceiver()
-        self.processor = VideoProcessor(db_session=db_session, enable_ai=enable_ai)
+        if enable_ai is None:
+            enable_ai = os.getenv("PHONE_MONITORING_ENABLE_AI", "true").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+        self.enable_ai = bool(enable_ai)
+        self.processor = VideoProcessor(db_session=db_session, enable_ai=self.enable_ai)
         self.current_stream_id = None
         self.is_processing = False
         self.save_frames = save_frames
@@ -94,80 +104,101 @@ class PhoneFeedProcessor:
         
         self.current_stream_id = stream_id
         self.is_processing = True
-        
-        # Initialize results
-        activities = []
-        violations = []
-        frame_count = 0
+
+        live_state = LiveFootageAccumState()
+        self.processor._current_exam_id = exam_id
+        self.processor._current_room_id = room_id
+        self.processor._ensure_invigilator_adapter(stream_id)
+        seat_payload: Dict[str, Any] = {"map": seat_mapping}
+
         saved_frames = []
-        
+        frame_count = 0
+
         async def frame_callback(frame, frame_num, timestamp):
-            """Process each frame from phone stream"""
-            nonlocal frame_count, activities, violations, saved_frames
-            
+            """Save sampled frame, then run the same live pipeline as CCTV (AI, seats, invig, R2)."""
+            nonlocal frame_count
+
             frame_count += 1
-            # Update live frame count for real-time status
             self.live_frame_count[stream_id] = frame_count
-            
-            # Save frame to disk if enabled
+
             frame_path = None
             if self.save_frames:
                 try:
-                    # Ensure frame is numpy array (for cv2.imwrite)
                     if not isinstance(frame, np.ndarray):
-                        if hasattr(frame, '__array__'):
+                        if hasattr(frame, "__array__"):
                             frame = np.array(frame)
                         else:
-                            logger.warning(f"Frame {frame_num} is not in expected format (type: {type(frame)})")
+                            logger.warning(
+                                "Frame %s is not in expected format (type: %s)",
+                                frame_num,
+                                type(frame),
+                            )
                             return
-                    
-                    frame_filename = f"phone_{stream_id}_{frame_num}_{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
+
+                    frame_filename = (
+                        f"phone_{stream_id}_{frame_num}_"
+                        f"{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
+                    )
                     simple_dir, _ = ensure_session_frame_dirs_under(
                         self.frame_dir, stream_id
                     )
                     frame_path = simple_dir / frame_filename
-                    
-                    # Save frame
+
                     success = cv2.imwrite(str(frame_path), frame)
                     if success:
-                        saved_frames.append({
-                            "frame_number": frame_num,
-                            "timestamp": timestamp.isoformat(),
-                            "frame_path": str(frame_path)
-                        })
+                        saved_frames.append(
+                            {
+                                "frame_number": frame_num,
+                                "timestamp": timestamp.isoformat(),
+                                "frame_path": str(frame_path),
+                            }
+                        )
                         if frame_count % 10 == 0:
-                            logger.info(f"Saved frame {frame_num} to {frame_path}")
+                            logger.info("Saved frame %s to %s", frame_num, frame_path)
                     else:
-                        logger.warning(f"Failed to save frame {frame_num} - cv2.imwrite returned False")
+                        logger.warning(
+                            "Failed to save frame %s — cv2.imwrite returned False",
+                            frame_num,
+                        )
                 except Exception as e:
-                    logger.error(f"Failed to save frame {frame_num}: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # Log progress
+                    logger.error("Failed to save frame %s: %s", frame_num, e, exc_info=True)
+
             if frame_count % 10 == 0:
-                logger.info(f"Captured {frame_count} frames from phone stream" + 
-                          (f" ({len(saved_frames)} saved)" if self.save_frames else ""))
-            
-            # Use VideoProcessor's frame processing logic
-            # For now, just log frames (AI detection can be enabled)
-            if self.processor.enable_ai and self.processor.behavior_detector:
-                # AI processing would go here
-                logger.debug(f"Processing frame {frame_num} with AI")
-            else:
-                logger.debug(f"Frame {frame_num} captured (AI disabled)")
-            
-            # Store frame info for later analysis
-            frame_info = {
-                "frame_number": frame_num,
-                "timestamp": timestamp.isoformat(),
-                "stream_id": stream_id,
-                "frame_path": frame_path
-            }
-            
-            # You can add frame analysis here
-            # For now, we'll just track frame count
-        
+                logger.info(
+                    "Captured %s frames from phone stream (%s saved)",
+                    frame_count,
+                    len(saved_frames) if self.save_frames else 0,
+                )
+
+            if self.enable_ai and isinstance(frame, np.ndarray):
+                if seat_payload["map"] is None and self.processor.db_session:
+                    try:
+                        from uuid import UUID
+
+                        UUID(str(room_id))
+                        h, w = frame.shape[:2]
+                        seat_payload["map"] = (
+                            self.processor.stream_handler.get_seat_map_for_room(
+                                str(room_id), w, h, self.processor.db_session
+                            )
+                        )
+                    except (ValueError, TypeError, AttributeError):
+                        pass
+                stub = (
+                    str(frame_path)
+                    if frame_path is not None
+                    else f"uploads/live/phone_{stream_id}_{frame_num}.jpg"
+                )
+                await self.processor._run_live_frame_pipeline(
+                    frame,
+                    frame_num,
+                    timestamp,
+                    seat_payload["map"],
+                    room_id,
+                    live_state,
+                    live_frame_stub=stub,
+                )
+
         # Store stream URL for real-time access
         self.live_stream_url[stream_id] = working_url
         self.live_frame_count[stream_id] = 0
@@ -180,7 +211,14 @@ class PhoneFeedProcessor:
                 frame_callback=frame_callback,
                 process_every_n_frames=process_every_n_frames
             )
-            
+
+            if self.enable_ai:
+                await self.processor._finalize_live_student_runs(
+                    exam_id, room_id, live_state
+                )
+            activities = live_state.activities
+            violations = live_state.violations
+
             # Compile results
             results = {
                 "success": stream_result.get("success", False),

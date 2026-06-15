@@ -8,6 +8,7 @@ Frame-run logic: track consecutive same-label frames per student. One violation 
 sustained labels (e.g. look around) require min consecutive frames; instant labels (e.g. phone) count from 1 frame.
 """
 
+import os
 from typing import Dict, List, Tuple, Optional, Any
 from uuid import UUID
 from datetime import datetime, timedelta
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 from database.cheating_labels import (
     CHEATING_LABEL_RANK,
     is_merged_activity_type,
+    merge_behavior_labels,
     split_merged_activity,
 )
 
@@ -74,13 +76,70 @@ def _normalize_activity_type(activity_type: str) -> str:
 
 def _run_boundary_key(raw: str) -> str:
     """
-    Key for consecutive-run grouping. Merged strings use exact canonical text;
-    singletons use normalized activity key (legacy behaviour).
+    Legacy key: merged strings use exact text (splits runs when merge string changes).
+    Prefer :func:`run_continuity_key` for grouping consecutive frames into one session.
     """
     s = (raw or "").strip() or "unknown"
     if is_merged_activity_type(s):
         return s
     return _normalize_activity_type(s)
+
+
+def run_continuity_key(raw: str) -> str:
+    """
+    Key for grouping consecutive frames into one semantic session.
+
+    Merged labels (e.g. ``phone; Look Around``) use the dominant (highest
+    ``CHEATING_LABEL_RANK``) component so adjacent pure ``phone`` frames stay in
+    the same run as mixed frames — avoids one DB row per frame when the model
+    alternates ``phone`` vs ``phone; Look Around`` on consecutive extracts.
+    """
+    s = (raw or "").strip() or "unknown"
+    if is_merged_activity_type(s):
+        parts = [p for p in split_merged_activity(s) if p and p != "Normal"]
+        if not parts:
+            return _normalize_activity_type(s)
+        dominant = max(parts, key=lambda p: CHEATING_LABEL_RANK.get(p, -1))
+        return _normalize_activity_type(dominant)
+    return _normalize_activity_type(s)
+
+
+def _activity_run_max_gap_seconds() -> float:
+    try:
+        return max(5.0, float(os.getenv("ACTIVITY_RUN_MAX_GAP_SECONDS", "120").strip()))
+    except ValueError:
+        return 120.0
+
+
+def _detection_ts(d: Dict[str, Any]) -> Optional[datetime]:
+    t = d.get("timestamp")
+    if t is None:
+        return None
+    if isinstance(t, datetime):
+        return t
+    if isinstance(t, str):
+        s = t.strip().replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(s)
+        except ValueError:
+            return None
+    return None
+
+
+def merged_behavior_type_for_run(detections: List[Dict[str, Any]]) -> str:
+    """Single stored activity_type for a run: merged union of all frame labels (severity order)."""
+    parts: List[str] = []
+    for d in detections:
+        raw = (d.get("behavior_type") or d.get("activity_type") or "").strip()
+        if not raw or raw == "Normal":
+            continue
+        if is_merged_activity_type(raw):
+            parts.extend(split_merged_activity(raw))
+        else:
+            parts.append(raw)
+    if not parts:
+        return "unknown"
+    return merge_behavior_labels(parts)
 
 
 def _severity_config_key_for_activity(activity_type: str) -> str:
@@ -162,9 +221,15 @@ class LabelRun:
 
 def get_runs_from_detections(detections: List[Dict[str, Any]]) -> List[LabelRun]:
     """
-    Group detections into consecutive same-label runs (by timestamp).
-    When the label changes (including to/from 'normal'), a new run starts.
-    Detections must be sorted by timestamp; we sort if not.
+    Group detections into consecutive runs (by timestamp).
+
+    Uses :func:`run_continuity_key` so ``phone`` and ``phone; Look Around`` share
+    one session when frames are consecutive. Splits when continuity key changes,
+    when ``normal`` dominates, or when the gap between frame timestamps exceeds
+    ``ACTIVITY_RUN_MAX_GAP_SECONDS`` (default 120s).
+
+    ``label_raw`` on each run is the merged union of all behaviours in that run
+    (for matrix lookup and a single DB row per sustained incident).
     """
     if not detections:
         return []
@@ -172,44 +237,50 @@ def get_runs_from_detections(detections: List[Dict[str, Any]]) -> List[LabelRun]
     runs: List[LabelRun] = []
     current: List[Dict] = []
     current_key: Optional[str] = None
+    max_gap = _activity_run_max_gap_seconds()
+
+    def _flush_current() -> None:
+        nonlocal current, current_key
+        if not current or not current_key or current_key == "normal":
+            current = []
+            current_key = None
+            return
+        label_raw = merged_behavior_type_for_run(current)
+        runs.append(
+            LabelRun(
+                start_ts=current[0].get("timestamp"),
+                end_ts=current[-1].get("timestamp"),
+                label_raw=label_raw,
+                normalized_key=_severity_config_key_for_activity(label_raw),
+                frame_count=len(current),
+                first_detection=current[0],
+            )
+        )
+        current = []
+        current_key = None
 
     for d in sorted_d:
         raw = (d.get("behavior_type") or d.get("activity_type") or "").strip() or "unknown"
-        key = _run_boundary_key(raw)
-        if key != current_key:
-            if current and current_key and current_key != "normal":
-                label_raw = (
-                    current[0].get("behavior_type")
-                    or current[0].get("activity_type")
-                    or raw
-                )
-                runs.append(LabelRun(
-                    start_ts=current[0].get("timestamp"),
-                    end_ts=current[-1].get("timestamp"),
-                    label_raw=label_raw,
-                    normalized_key=_severity_config_key_for_activity(label_raw),
-                    frame_count=len(current),
-                    first_detection=current[0],
-                ))
+        key = run_continuity_key(raw)
+        if key == "normal":
+            _flush_current()
+            continue
+
+        gap_exceeded = False
+        if current and current_key == key:
+            t_prev = _detection_ts(current[-1])
+            t_cur = _detection_ts(d)
+            if t_prev is not None and t_cur is not None:
+                gap_exceeded = (t_cur - t_prev).total_seconds() > max_gap
+
+        if key != current_key or gap_exceeded:
+            _flush_current()
             current = [d]
             current_key = key
         else:
             current.append(d)
 
-    if current and current_key and current_key != "normal":
-        label_raw = (
-            current[0].get("behavior_type")
-            or current[0].get("activity_type")
-            or "unknown"
-        )
-        runs.append(LabelRun(
-            start_ts=current[0].get("timestamp"),
-            end_ts=current[-1].get("timestamp"),
-            label_raw=label_raw,
-            normalized_key=_severity_config_key_for_activity(label_raw),
-            frame_count=len(current),
-            first_detection=current[0],
-        ))
+    _flush_current()
     return runs
 
 

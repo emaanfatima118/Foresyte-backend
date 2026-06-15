@@ -70,6 +70,8 @@ def student_activity_to_dict(
         "severity": a.severity,
         "confidence": a.confidence,
         "evidence_url": a.evidence_url,
+        "report_evidence_url": getattr(a, "report_evidence_url", None),
+        "identification_evidence_url": getattr(a, "identification_evidence_url", None),
         "run_frame_count": getattr(a, "run_frame_count", None),
         "severity_rule": getattr(a, "severity_rule", None),
         "student_name": st.name if st else None,

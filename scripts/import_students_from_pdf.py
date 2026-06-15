@@ -51,42 +51,9 @@ from sqlalchemy.exc import IntegrityError
 from database.db import SessionLocal
 from database.models import Student
 from database.auth import hash_password
-
-
-def generate_email_from_roll_number(roll_number: str) -> str:
-    """
-    Generate email address from roll number.
-    
-    Pattern: XXY-AAAA -> YXXAAAA@nu.edu.pk (Y is lowercase)
-    
-    Example: 22I-0857 -> i220857@nu.edu.pk
-             22I-0839 -> i220839@nu.edu.pk
-             22P-0507 -> p220507@nu.edu.pk
-    
-    Args:
-        roll_number: Roll number in format XXY-AAAA
-        
-    Returns:
-        Email address in format YXXAAAA@nu.edu.pk (where Y is lowercase letter)
-    """
-    # Remove any whitespace
-    roll_number = roll_number.strip()
-    
-    # Match pattern: XXY-AAAA where XX is 2 digits, Y is a letter, AAAA is 4 digits
-    match = re.match(r'^(\d{2})([A-Za-z])-(\d{4})$', roll_number)
-    
-    if not match:
-        raise ValueError(f"Invalid roll number format: {roll_number}. Expected format: XXY-AAAA (e.g., 22I-0839)")
-    
-    digits1 = match.group(1)  # XX (e.g., "22")
-    letter = match.group(2).lower()  # Y (e.g., "I" -> "i")
-    digits2 = match.group(3)  # AAAA (e.g., "0857")
-    
-    # Generate email: Y(lowercase) + XX + AAAA + @nu.edu.pk
-    # Example: 22I-0857 -> i220857@nu.edu.pk
-    email = f"{letter}{digits1}{digits2}@nu.edu.pk"
-    
-    return email
+from database.student_email_from_roll import (
+    generate_nu_student_email_from_roll as generate_email_from_roll_number,
+)
 
 
 def parse_pdf_table(pdf_path: Path) -> list:

@@ -168,7 +168,7 @@ cython_debug/
 # VSCode
 .vscode/
 *.code-workspace
-
+*pyc
 # PyCharm
 .idea/
 *.iml

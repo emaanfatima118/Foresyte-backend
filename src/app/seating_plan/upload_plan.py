@@ -14,6 +14,10 @@ from bson import ObjectId
 
 from database.db import get_db
 from database.models import Exam, Room, Seat, Student
+from database.student_email_from_roll import (
+    corrected_nu_email_if_legacy_bug,
+    generate_nu_student_email_from_roll,
+)
 
 router = APIRouter()
 
@@ -356,8 +360,16 @@ async def upload_seating_plan(
             # Find or create student
             student = db.query(Student).filter(Student.roll_number == roll_number).first()
             if not student:
-                # Generate email from roll number (fallback)
-                email = f"{roll_number.lower().replace('-', '')}@nu.edu.pk"
+                try:
+                    email = generate_nu_student_email_from_roll(roll_number)
+                except ValueError as e:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Invalid roll number for student {student_name!r}: "
+                            f"{roll_number!r}. {e}"
+                        ),
+                    ) from e
                 student = Student(
                     name=student_name,
                     email=email,
@@ -366,6 +378,22 @@ async def upload_seating_plan(
                 db.add(student)
                 db.commit()
                 db.refresh(student)
+            else:
+                # Earlier uploads stored the wrong local-part; repair on re-upload without
+                # overwriting unrelated @nu.edu.pk addresses.
+                fixed = corrected_nu_email_if_legacy_bug(roll_number, student.email)
+                if fixed:
+                    taken = (
+                        db.query(Student)
+                        .filter(
+                            Student.email == fixed,
+                            Student.student_id != student.student_id,
+                        )
+                        .first()
+                    )
+                    if not taken:
+                        student.email = fixed
+                        db.add(student)
 
             # Create or update seat assignment
             seat_number = student_data['seat_no']

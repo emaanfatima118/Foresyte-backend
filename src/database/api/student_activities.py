@@ -34,6 +34,8 @@ class StudentActivityRead(BaseModel):
     severity: Optional[str]
     confidence: Optional[float]
     evidence_url: Optional[str]
+    report_evidence_url: Optional[str] = None
+    identification_evidence_url: Optional[str] = None
     run_frame_count: Optional[int] = None
     severity_rule: Optional[str] = None
     student_name: Optional[str] = None
@@ -211,8 +213,10 @@ def get_activities_by_student_id(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Get all activities for a specific student.
-    Returns empty list if no activities found (instead of 404).
+    Activities for a specific student.
+
+    Students always receive an empty list (raw detections are not exposed).
+    Admins and investigators receive the full activity history.
     """
     user_type = current_user.get("user_type")
     user_id = current_user.get("id")
@@ -227,6 +231,10 @@ def get_activities_by_student_id(
     student = db.query(Student).filter(Student.student_id == student_id).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
+
+    # Students do not receive raw detection activities; investigators/admins still can.
+    if user_type == "student":
+        return []
 
     activities = db.query(StudentActivity).filter(StudentActivity.student_id == student_id).all()
 

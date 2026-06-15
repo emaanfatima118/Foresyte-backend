@@ -59,6 +59,7 @@ from database.models import (
     VideoStream, ProcessingJob, FrameLog
 )
 from database.auth import hash_password
+from database.student_email_from_roll import generate_nu_student_email_from_roll
 
 
 # Default password for all dummy users
@@ -204,7 +205,7 @@ def add_dummy_users(db: Session, num_each: int = 5):
         last_name = random.choice(LAST_NAMES)
         name = f"{first_name} {last_name}"
         roll_number = generate_roll_number()
-        email = f"{roll_number.lower().replace('-', '')}@nu.edu.pk"
+        email = generate_nu_student_email_from_roll(roll_number)
         
         try:
             student = Student(

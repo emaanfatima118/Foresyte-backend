@@ -535,9 +535,9 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
             # Top-line stats row
             stat_items = []
             if 'total_activities' in summary:
-                stat_items.append(('Total Activities', str(summary['total_activities'])))
+                stat_items.append(('Flagged activities', str(summary['total_activities'])))
             if 'total_violations' in summary:
-                stat_items.append(('Total Violations', str(summary['total_violations'])))
+                stat_items.append(('Confirmed violations', str(summary['total_violations'])))
             if 'unique_students_flagged' in summary:
                 stat_items.append(('Students Flagged', str(summary['unique_students_flagged'])))
             if exam_info.get('name'):
@@ -633,11 +633,11 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
                     _usable_w * 0.92, leading_page_break=False,
                 )
 
-        # ── Detailed violation table ──────────────────────────────────────────
+        # All flagged student activities; violation status column when a formal violation exists
         if data.get('activities'):
-            story.extend(_section_heading("Detailed Violation Report"))
+            story.extend(_section_heading("Student activity detail"))
 
-            # Column widths: Student | Roll | Violation | Time | Severity | Status | Evidence
+            # Column widths: Student | Roll | Activity | Time | Severity | Violation status | Evidence
             _cw = [
                 _usable_w * 0.14,
                 _usable_w * 0.10,
@@ -661,7 +661,7 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
             # Header
             hdr_data = [[
                 _pdf_paragraph_cell(h, header_cell_style)
-                for h in ('Student', 'Roll No.', 'Violation', 'Time', 'Severity', 'Status', 'Evidence')
+                for h in ('Student', 'Roll No.', 'Activity', 'Time', 'Severity', 'Violation status', 'Evidence')
             ]]
             hdr_tbl = Table(hdr_data, colWidths=_cw)
             hdr_ts = TableStyle(list(_base_ts.getCommands()))
@@ -672,8 +672,6 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
             story.append(hdr_tbl)
 
             for idx, activity in enumerate(data["activities"]):
-                violation_info = activity.get("violation", {}) or {}
-
                 student_name = str(activity.get("student_name") or "Unknown")
                 if len(student_name) > 24:
                     student_name = student_name[:21] + "…"
@@ -698,16 +696,20 @@ def generate_pdf_report(data: Dict[str, Any], file_path: str) -> bool:
                 )
 
                 row_bg = C_PANEL if idx % 2 == 0 else C_STRIPE
+
+                violation_info = activity.get("violation") or {}
+                if violation_info.get("violation_id"):
+                    row_status = str(violation_info.get("status") or "pending")
+                else:
+                    row_status = "Not reviewed"
+
                 row_data = [[
                     _pdf_paragraph_cell(student_name, cell_bold),
                     _pdf_paragraph_cell(activity.get("student_roll_number") or "—", cell_style),
                     _pdf_paragraph_cell(activity.get("activity_type") or "—", cell_style, soft_wrap_chars=60),
                     _pdf_paragraph_cell(time_only, cell_style),
                     Paragraph(sev_label, sev_badge_style),
-                    _pdf_paragraph_cell(
-                        violation_info.get("status", "pending") if violation_info else "—",
-                        cell_style,
-                    ),
+                    _pdf_paragraph_cell(row_status, cell_style),
                     _pdf_link_cell(evidence_url, cell_style, display_text="View evidence", soft_wrap_chars=50)
                     if evidence_url else _pdf_paragraph_cell("—", cell_style),
                 ]]
@@ -1579,25 +1581,12 @@ def generate_incident_report(
     filename = f"incident_report_{timestamp}.{request.format}"
     file_path = os.path.join("reports", filename)
 
-    # Create report record
-    # For now, we'll create a report linked to the first violation if available
+    # Create report record (violation_id optional — reports list all flagged student activities)
     violation = None
     if activities:
         violation = db.query(Violation).filter(
             Violation.activity_id == activities[0].activity_id
         ).first()
-
-    if not violation:
-        # Create a placeholder violation if needed
-        violation = Violation(
-            activity_id=activities[0].activity_id,
-            violation_type=activities[0].activity_type or "Unknown",
-            severity=1,
-            status="pending"
-        )
-        db.add(violation)
-        db.commit()
-        db.refresh(violation)
 
     # Get investigator_id for report (handles both admin and investigator users)
     investigator_id = get_investigator_id_for_report(current_user, db)
@@ -1607,7 +1596,7 @@ def generate_incident_report(
         name=initial_name,
         report_type="incident",
         file_path=file_path,
-        violation_id=violation.violation_id,
+        violation_id=violation.violation_id if violation else None,
         generated_by=investigator_id,
         status="generating"  # Will be updated to "completed" by background task
     )
@@ -1682,17 +1671,6 @@ def generate_exam_report(
         violation = db.query(Violation).filter(
             Violation.activity_id == activities[0].activity_id
         ).first()
-
-    if not violation and activities:
-        violation = Violation(
-            activity_id=activities[0].activity_id,
-            violation_type="Exam Report",
-            severity=1,
-            status="pending"
-        )
-        db.add(violation)
-        db.commit()
-        db.refresh(violation)
 
     # Get investigator_id for report (handles both admin and investigator users)
     investigator_id = get_investigator_id_for_report(current_user, db)

@@ -3,6 +3,7 @@ Video Processing Orchestrator - Complete UC-07 Implementation
 Coordinates video processing, AI detection, and database logging
 """
 
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple
 from collections import defaultdict
@@ -35,6 +36,21 @@ from database.severity_logic import (
 from database.violation_severity_matrix import resolve_activity_severity
 
 logging.basicConfig(level=logging.INFO)
+
+
+@dataclass
+class LiveFootageAccumState:
+    """Per-stream accumulators for live CCTV or phone monitoring (student runs + invig rows)."""
+
+    frame_count: int = 0
+    live_identification_path: Optional[str] = None
+    live_identification_url: Optional[str] = None
+    activities: List[Any] = field(default_factory=list)
+    violations: List[Any] = field(default_factory=list)
+    student_roll_cache: Dict[str, str] = field(default_factory=dict)
+    detections_by_student_live: Dict[str, List[Dict]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
 
 
 def _evidence_path_to_url(file_path: Optional[str]) -> Optional[str]:
@@ -482,6 +498,346 @@ class VideoProcessor:
     def set_progress_callback(self, callback):
         """Set callback function to update progress during frame extraction"""
         self.progress_callback = callback
+
+    def _ensure_invigilator_adapter(self, stream_id: str = "unknown") -> None:
+        """Load invigilator frame adapter when enabled (shared by CCTV live + phone live)."""
+        self.invig_adapter = None
+        _inv_env = (os.getenv("ENABLE_INVIGILATOR_DETECTION") or "true").strip().lower()
+        _enable_inv = _inv_env not in ("0", "false", "no", "off", "")
+        if _enable_inv:
+            try:
+                from app.invigilator.invig_adapter import InvigFrameAdapter
+
+                self.invig_adapter = InvigFrameAdapter()
+                logger.info(
+                    "Invigilator detection adapter initialized for stream %s", stream_id
+                )
+            except FileNotFoundError as e:
+                logger.warning(
+                    "Invigilator model not found — invigilator activities will not be detected: %s",
+                    e,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Invigilator detection adapter failed to load — invigilator activities disabled: %s",
+                    e,
+                    exc_info=True,
+                )
+        else:
+            logger.info(
+                "Invigilator detection disabled (ENABLE_INVIGILATOR_DETECTION=false); "
+                "no invigilator activities will be logged"
+            )
+
+    def _roll_for_student_live(
+        self, student_roll_cache: Dict[str, str], student_id: Optional[str]
+    ) -> str:
+        if not student_id:
+            return "UNIDENTIFIED-AI"
+        if student_id in student_roll_cache:
+            return student_roll_cache[student_id]
+        roll = "UNIDENTIFIED-AI"
+        if self.db_session:
+            try:
+                from uuid import UUID
+                from database.models import Student
+
+                student = self.db_session.query(Student).filter(
+                    Student.student_id == UUID(str(student_id))
+                ).first()
+                if student and student.roll_number:
+                    roll = str(student.roll_number)
+            except Exception:
+                pass
+        student_roll_cache[student_id] = roll
+        return roll
+
+    async def _run_live_frame_pipeline(
+        self,
+        frame,
+        frame_num: int,
+        timestamp: datetime,
+        seat_mapping: Optional[Dict],
+        room_id: str,
+        state: LiveFootageAccumState,
+        live_frame_stub: Optional[str] = None,
+    ) -> None:
+        """
+        One sampled live frame: student behaviour AI, seat mapping, invigilator, DB + R2 evidence.
+        Used by CCTV live streams and phone monitoring.
+        """
+        stub = live_frame_stub or f"uploads/live/frame_{frame_num}.jpg"
+
+        if self.process_frame:
+            analysis = self.process_frame(frame, frame_num, timestamp, seat_mapping)
+            student_behaviors = analysis.get("student_behaviors", [])
+        else:
+            student_behaviors = []
+
+        if self.invig_adapter is not None:
+            try:
+                invigilator_behaviors = self.invig_adapter.process_frame(
+                    frame, frame_num, timestamp
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Invigilator detection failed on live frame %d: %s",
+                    frame_num,
+                    exc,
+                )
+                invigilator_behaviors = []
+        else:
+            invigilator_behaviors = []
+
+        frame_student_groups: Dict[tuple, List[Dict]] = defaultdict(list)
+        _unmapped_slot = [0]
+
+        def _frame_group_key(sid, frame_no: int, behavior: Dict) -> tuple:
+            if sid:
+                return ("id", str(sid), frame_no)
+            student_index = behavior.get("student_index")
+            if student_index is not None:
+                return ("idx", int(student_index), frame_no)
+            bbox = behavior.get("bbox")
+            if bbox and len(bbox) >= 4:
+                bbox_key = tuple(int(round(float(x))) for x in bbox[:4])
+            else:
+                _unmapped_slot[0] += 1
+                bbox_key = ("slot", _unmapped_slot[0])
+            return ("bbox", bbox_key, frame_no)
+
+        for behavior in student_behaviors:
+            seat_id = (
+                self.map_detection_to_seat(behavior, seat_mapping)
+                if (self.process_frame and self.map_detection_to_seat)
+                else None
+            )
+            student_id = behavior.get("student_id") or (
+                seat_id if isinstance(seat_id, str) else None
+            )
+            gkey = _frame_group_key(student_id, frame_num, behavior)
+            frame_student_groups[gkey].append(
+                {
+                    **behavior,
+                    "seat_id": seat_id,
+                    "student_id": str(student_id) if student_id else None,
+                }
+            )
+        frame_student_groups = _merge_unmapped_frame_groups(frame_student_groups)
+        shared_student_report_evidence_path = None
+        shared_student_report_evidence_url = None
+        identification_evidence_path = None
+        identification_evidence_url = None
+        shared_student_report_bboxes = [
+            b.get("bbox")
+            for blist in frame_student_groups.values()
+            for b in blist
+            if b.get("bbox")
+        ]
+        if shared_student_report_bboxes:
+            shared_student_report_evidence_path = stub
+            shared_student_report_evidence_url = _evidence_path_to_url(stub)
+            if state.live_identification_url is None:
+                identification_students = []
+                for blist in frame_student_groups.values():
+                    exemplar = next(
+                        (b for b in blist if b.get("bbox")),
+                        blist[0] if blist else None,
+                    )
+                    if not exemplar or not exemplar.get("bbox"):
+                        continue
+                    identification_students.append(
+                        {
+                            "bbox": exemplar.get("bbox"),
+                            "roll_number": self._roll_for_student_live(
+                                state.student_roll_cache,
+                                exemplar.get("student_id"),
+                            ),
+                        }
+                    )
+                    identification_evidence_path, identification_evidence_url = (
+                        _save_student_identification_frame(
+                            frame,
+                            stub,
+                            identification_students,
+                        )
+                    )
+                    state.live_identification_path = identification_evidence_path
+                    state.live_identification_url = identification_evidence_url
+                else:
+                    identification_evidence_path = state.live_identification_path
+                    identification_evidence_url = state.live_identification_url
+        for _gkey, blist in frame_student_groups.items():
+            labels = [b["behavior_type"] for b in blist]
+            merged = merge_behavior_labels(labels)
+            if not merged:
+                continue
+            base_sev = merged_base_severity(labels)
+            details = merge_frame_behavior_details(blist)
+            max_conf = max(float(b.get("confidence") or 0) for b in blist)
+            detection = {
+                "timestamp": timestamp.isoformat(),
+                "frame_number": frame_num,
+                "behavior_type": merged,
+                "severity": base_sev,
+                "confidence": max_conf,
+                "seat_id": blist[0].get("seat_id"),
+                "student_id": blist[0].get("student_id"),
+                "details": details or blist[0].get("details", ""),
+                "report_evidence_path": shared_student_report_evidence_path,
+                "report_evidence_url": shared_student_report_evidence_url,
+                "identification_evidence_path": identification_evidence_path,
+                "identification_evidence_url": identification_evidence_url,
+                "actor_type": "student",
+            }
+            sk = (
+                str(blist[0].get("student_id"))
+                if blist[0].get("student_id")
+                else _anonymous_student_bucket(
+                    blist[0],
+                    seat_id=blist[0].get("seat_id"),
+                )
+            )
+            state.detections_by_student_live[sk].append(detection)
+
+        for behavior in invigilator_behaviors:
+            report_evidence_path = None
+            report_evidence_url = None
+            if behavior.get("bbox"):
+                report_evidence_path, report_evidence_url = _save_report_bbox_frame(
+                    frame,
+                    stub,
+                    "invigilator",
+                    f"frame_{frame_num}_{behavior.get('tracker_id', 'unknown')}_{behavior['behavior_type'][:32]}",
+                    [behavior.get("bbox")],
+                    (255, 0, 0),
+                )
+            else:
+                report_evidence_path, report_evidence_url = (
+                    _save_invigilator_full_frame_evidence(
+                        frame,
+                        stub,
+                        f"f{frame_num}_{behavior.get('tracker_id', 'u')}_{str(behavior.get('behavior_type', ''))[:40]}",
+                    )
+                )
+            activity = {
+                "timestamp": timestamp.isoformat(),
+                "frame_number": frame_num,
+                "behavior_type": behavior["behavior_type"],
+                "severity": behavior["severity"],
+                "confidence": behavior["confidence"],
+                "details": behavior.get("details", ""),
+                "tracker_id": behavior.get("tracker_id"),
+                "bbox": behavior.get("bbox"),
+                "evidence_path": report_evidence_path,
+                "evidence_url": report_evidence_url,
+                "report_evidence_path": report_evidence_path,
+                "report_evidence_url": report_evidence_url,
+                "actor_type": "invigilator",
+            }
+            state.activities.append(activity)
+            if self.db_session:
+                await self._log_invigilator_activity_to_db(activity, room_id)
+
+        state.frame_count += 1
+        if state.frame_count % 100 == 0:
+            logger.info("Processed %s live pipeline frames", state.frame_count)
+
+    async def _finalize_live_student_runs(
+        self,
+        exam_id: str,
+        room_id: str,
+        state: LiveFootageAccumState,
+    ) -> None:
+        """Collapse per-frame student detections into runs and persist StudentActivity rows."""
+        for student_key, det_list in state.detections_by_student_live.items():
+            runs = get_runs_from_detections(det_list)
+            qualifying = filter_qualifying_runs(runs)
+            if not qualifying and det_list:
+                merged_runs = get_runs_from_detections(det_list)
+                logger.info(
+                    "No qualifying student runs in live mode for key=%s; logging %d merged run(s) from %d detections",
+                    student_key,
+                    len(merged_runs),
+                    len(det_list),
+                )
+                for run in merged_runs:
+                    if not run.label_raw or run.normalized_key == "normal":
+                        continue
+                    fd = run.first_detection
+                    severity_str, severity_rule = resolve_activity_severity(
+                        run.label_raw,
+                        run.frame_count,
+                    )
+                    activity = {
+                        "timestamp": fd.get("timestamp"),
+                        "frame_number": fd.get("frame_number"),
+                        "behavior_type": run.label_raw,
+                        "severity": severity_str,
+                        "run_frame_count": run.frame_count,
+                        "severity_rule": f"{severity_rule}_run_merge",
+                        "confidence": fd.get("confidence"),
+                        "seat_id": fd.get("seat_id"),
+                        "student_id": fd.get("student_id")
+                        if not str(student_key).startswith(
+                            ("bbox:", "seat:", "unidentified")
+                        )
+                        else None,
+                        "details": (fd.get("details", "") or "").strip()
+                        or f"Sustained {run.frame_count} consecutive sampled frame(s) (same incident).",
+                        "report_evidence_path": fd.get("report_evidence_path"),
+                        "report_evidence_url": fd.get("report_evidence_url"),
+                        "identification_evidence_path": fd.get("identification_evidence_path")
+                        or state.live_identification_path,
+                        "identification_evidence_url": fd.get("identification_evidence_url")
+                        or state.live_identification_url,
+                        "actor_type": "student",
+                    }
+                    state.activities.append(activity)
+                    if self.db_session:
+                        await self._log_activity_and_violation(
+                            activity,
+                            exam_id,
+                            room_id,
+                            create_violation=False,
+                        )
+            for run in qualifying:
+                fd = run.first_detection
+                severity_str, severity_rule = resolve_activity_severity(
+                    run.label_raw, run.frame_count
+                )
+                activity = {
+                    "timestamp": fd.get("timestamp"),
+                    "frame_number": fd.get("frame_number"),
+                    "behavior_type": run.label_raw,
+                    "severity": severity_str,
+                    "run_frame_count": run.frame_count,
+                    "severity_rule": severity_rule,
+                    "confidence": fd.get("confidence"),
+                    "seat_id": fd.get("seat_id"),
+                    "student_id": fd.get("student_id")
+                    if not str(student_key).startswith(
+                        ("bbox:", "seat:", "unidentified")
+                    )
+                    else None,
+                    "details": fd.get("details", "")
+                    or f"({run.frame_count} consecutive frames)",
+                    "report_evidence_path": fd.get("report_evidence_path"),
+                    "report_evidence_url": fd.get("report_evidence_url"),
+                    "identification_evidence_path": state.live_identification_path
+                    or fd.get("identification_evidence_path"),
+                    "identification_evidence_url": state.live_identification_url
+                    or fd.get("identification_evidence_url"),
+                    "actor_type": "student",
+                }
+                state.activities.append(activity)
+                if self.db_session:
+                    await self._log_activity_and_violation(
+                        activity,
+                        exam_id,
+                        room_id,
+                        create_violation=False,
+                    )
         
     async def process_video_stream(self, stream_id: str, source: str, 
                                    stream_type: str, exam_id: str,
@@ -507,33 +863,7 @@ class VideoProcessor:
         self._current_exam_id = exam_id
         self._current_room_id = room_id
 
-        # Invigilator pose/activity detection: on by default when unset so upload pipeline
-        # persists InvigilatorActivity rows. Set ENABLE_INVIGILATOR_DETECTION=false to skip
-        # (saves load time if models are not deployed).
-        self.invig_adapter = None
-        _inv_env = (os.getenv("ENABLE_INVIGILATOR_DETECTION") or "true").strip().lower()
-        _enable_inv = _inv_env not in ("0", "false", "no", "off", "")
-        if _enable_inv:
-            try:
-                from app.invigilator.invig_adapter import InvigFrameAdapter
-                self.invig_adapter = InvigFrameAdapter()
-                logger.info("Invigilator detection adapter initialized for stream %s", stream_id)
-            except FileNotFoundError as e:
-                logger.warning(
-                    "Invigilator model not found — invigilator activities will not be detected: %s",
-                    e,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Invigilator detection adapter failed to load — invigilator activities disabled: %s",
-                    e,
-                    exc_info=True,
-                )
-        else:
-            logger.info(
-                "Invigilator detection disabled (ENABLE_INVIGILATOR_DETECTION=false); "
-                "no invigilator activities will be logged"
-            )
+        self._ensure_invigilator_adapter(stream_id)
 
         try:
             # Step 1: Connect to video source
@@ -602,322 +932,32 @@ class VideoProcessor:
         """
         Process live CCTV footage (real-time processing).
         Steps 3-6 of UC-07 for live streams.
-        
-        Args:
-            stream_id: Stream identifier
-            stream_url: CCTV stream URL
-            exam_id: Exam identifier
-            room_id: Room identifier
-            seat_mapping: Seat position mapping
-            
-        Returns:
-            Processing results
         """
         logger.info(f"Processing live stream: {stream_url}")
-
-        activities = []
-        violations = []
-        frame_count = 0
-        detections_by_student_live: Dict[str, List[Dict]] = defaultdict(list)
-        student_roll_cache: Dict[str, str] = {}
-        live_identification_path: Optional[str] = None
-        live_identification_url: Optional[str] = None
-
-        def _roll_for_student(student_id: Optional[str]) -> str:
-            if not student_id:
-                return "UNIDENTIFIED-AI"
-            if student_id in student_roll_cache:
-                return student_roll_cache[student_id]
-            roll = "UNIDENTIFIED-AI"
-            if self.db_session:
-                try:
-                    from uuid import UUID
-                    from database.models import Student
-
-                    student = self.db_session.query(Student).filter(
-                        Student.student_id == UUID(str(student_id))
-                    ).first()
-                    if student and student.roll_number:
-                        roll = str(student.roll_number)
-                except Exception:
-                    pass
-            student_roll_cache[student_id] = roll
-            return roll
+        state = LiveFootageAccumState()
 
         async def frame_callback(frame, frame_num, timestamp):
-            """Process each frame: collect detections per student for run-based logic."""
-            nonlocal frame_count, live_identification_path, live_identification_url
-            live_frame_stub = f"uploads/live/frame_{frame_num}.jpg"
-
-            if self.process_frame:
-                analysis = self.process_frame(
-                    frame, frame_num, timestamp, seat_mapping
-                )
-                student_behaviors = analysis.get('student_behaviors', [])
-            else:
-                student_behaviors = []
-
-            # Invigilator runs whenever the adapter is loaded (independent of student AI)
-            if self.invig_adapter is not None:
-                try:
-                    invigilator_behaviors = self.invig_adapter.process_frame(
-                        frame, frame_num, timestamp
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Invigilator detection failed on live frame %d: %s",
-                        frame_num,
-                        exc,
-                    )
-                    invigilator_behaviors = []
-            else:
-                invigilator_behaviors = []
-
-            frame_student_groups: Dict[tuple, List[Dict]] = defaultdict(list)
-            _unmapped_slot = [0]
-
-            def _frame_group_key(student_id, frame_no: int, behavior: Dict) -> tuple:
-                if student_id:
-                    return ("id", str(student_id), frame_no)
-                student_index = behavior.get("student_index")
-                if student_index is not None:
-                    return ("idx", int(student_index), frame_no)
-                bbox = behavior.get("bbox")
-                if bbox and len(bbox) >= 4:
-                    bbox_key = tuple(int(round(float(x))) for x in bbox[:4])
-                else:
-                    _unmapped_slot[0] += 1
-                    bbox_key = ("slot", _unmapped_slot[0])
-                return ("bbox", bbox_key, frame_no)
-
-            for behavior in student_behaviors:
-                seat_id = (
-                    self.map_detection_to_seat(behavior, seat_mapping)
-                    if (self.process_frame and self.map_detection_to_seat)
-                    else None
-                )
-                student_id = behavior.get("student_id") or (
-                    seat_id if isinstance(seat_id, str) else None
-                )
-                gkey = _frame_group_key(student_id, frame_num, behavior)
-                frame_student_groups[gkey].append(
-                    {
-                        **behavior,
-                        "seat_id": seat_id,
-                        "student_id": str(student_id) if student_id else None,
-                    }
-                )
-            frame_student_groups = _merge_unmapped_frame_groups(frame_student_groups)
-            shared_student_report_evidence_path = None
-            shared_student_report_evidence_url = None
-            identification_evidence_path = None
-            identification_evidence_url = None
-            shared_student_report_bboxes = [
-                b.get("bbox")
-                for blist in frame_student_groups.values()
-                for b in blist
-                if b.get("bbox")
-            ]
-            if shared_student_report_bboxes:
-                shared_student_report_evidence_path = live_frame_stub
-                shared_student_report_evidence_url = _evidence_path_to_url(live_frame_stub)
-                if live_identification_url is None:
-                    identification_students = []
-                    for blist in frame_student_groups.values():
-                        exemplar = next((b for b in blist if b.get("bbox")), blist[0] if blist else None)
-                        if not exemplar or not exemplar.get("bbox"):
-                            continue
-                        identification_students.append(
-                            {
-                                "bbox": exemplar.get("bbox"),
-                                "roll_number": _roll_for_student(exemplar.get("student_id")),
-                            }
-                        )
-                    identification_evidence_path, identification_evidence_url = (
-                        _save_student_identification_frame(
-                            frame,
-                            live_frame_stub,
-                            identification_students,
-                        )
-                    )
-                    live_identification_path = identification_evidence_path
-                    live_identification_url = identification_evidence_url
-                else:
-                    identification_evidence_path = live_identification_path
-                    identification_evidence_url = live_identification_url
-            for _gkey, blist in frame_student_groups.items():
-                labels = [b["behavior_type"] for b in blist]
-                merged = merge_behavior_labels(labels)
-                if not merged:
-                    continue
-                base_sev = merged_base_severity(labels)
-                details = merge_frame_behavior_details(blist)
-                max_conf = max(float(b.get("confidence") or 0) for b in blist)
-                detection = {
-                    "timestamp": timestamp.isoformat(),
-                    "frame_number": frame_num,
-                    "behavior_type": merged,
-                    "severity": base_sev,
-                    "confidence": max_conf,
-                    "seat_id": blist[0].get("seat_id"),
-                    "student_id": blist[0].get("student_id"),
-                    "details": details or blist[0].get("details", ""),
-                    "report_evidence_path": shared_student_report_evidence_path,
-                    "report_evidence_url": shared_student_report_evidence_url,
-                    "identification_evidence_path": identification_evidence_path,
-                    "identification_evidence_url": identification_evidence_url,
-                    "actor_type": "student",
-                }
-                sk = (
-                    str(blist[0].get("student_id"))
-                    if blist[0].get("student_id")
-                    else _anonymous_student_bucket(
-                        blist[0],
-                        seat_id=blist[0].get("seat_id"),
-                    )
-                )
-                detections_by_student_live[sk].append(detection)
-
-            for behavior in invigilator_behaviors:
-                report_evidence_path = None
-                report_evidence_url = None
-                if behavior.get("bbox"):
-                    report_evidence_path, report_evidence_url = _save_report_bbox_frame(
-                        frame,
-                        live_frame_stub,
-                        "invigilator",
-                        f"frame_{frame_num}_{behavior.get('tracker_id', 'unknown')}_{behavior['behavior_type'][:32]}",
-                        [behavior.get("bbox")],
-                        (255, 0, 0),
-                    )
-                else:
-                    report_evidence_path, report_evidence_url = _save_invigilator_full_frame_evidence(
-                        frame,
-                        live_frame_stub,
-                        f"f{frame_num}_{behavior.get('tracker_id', 'u')}_{str(behavior.get('behavior_type', ''))[:40]}",
-                    )
-                activity = {
-                    "timestamp": timestamp.isoformat(),
-                    "frame_number": frame_num,
-                    "behavior_type": behavior['behavior_type'],
-                    "severity": behavior['severity'],
-                    "confidence": behavior['confidence'],
-                    "details": behavior.get('details', ''),
-                    "tracker_id": behavior.get('tracker_id'),
-                    "bbox": behavior.get('bbox'),
-                    "evidence_path": report_evidence_path,
-                    "evidence_url": report_evidence_url,
-                    "report_evidence_path": report_evidence_path,
-                    "report_evidence_url": report_evidence_url,
-                    "actor_type": "invigilator",
-                }
-                activities.append(activity)
-                if self.db_session:
-                    await self._log_invigilator_activity_to_db(activity, room_id)
-
-            frame_count += 1
-            if frame_count % 100 == 0:
-                logger.info(f"Processed {frame_count} frames")
+            await self._run_live_frame_pipeline(
+                frame,
+                frame_num,
+                timestamp,
+                seat_mapping,
+                room_id,
+                state,
+                live_frame_stub=f"uploads/live/frame_{frame_num}.jpg",
+            )
 
         stream_result = await self.stream_handler.process_live_stream(
             stream_url, duration_seconds=3600, callback=frame_callback
         )
-
-        # Run-based logic: one activity + one violation per qualifying run per student
-        for student_key, det_list in detections_by_student_live.items():
-            runs = get_runs_from_detections(det_list)
-            qualifying = filter_qualifying_runs(runs)
-            if not qualifying and det_list:
-                logger.info(
-                    "No qualifying student runs in live mode for key=%s; using fallback detections=%d",
-                    student_key,
-                    len(det_list),
-                )
-                for fd in det_list:
-                    severity_str, severity_rule = resolve_activity_severity(
-                        str(fd.get("behavior_type") or "unknown"),
-                        1,
-                    )
-                    activity = {
-                        "timestamp": fd.get("timestamp"),
-                        "frame_number": fd.get("frame_number"),
-                        "behavior_type": fd.get("behavior_type"),
-                        "severity": severity_str,
-                        "run_frame_count": 1,
-                        "severity_rule": f"{severity_rule}_fallback",
-                        "confidence": fd.get("confidence"),
-                        "seat_id": fd.get("seat_id"),
-                        "student_id": fd.get("student_id") if not str(student_key).startswith(("bbox:", "seat:", "unidentified")) else None,
-                        "details": (fd.get("details", "") or "") + " [fallback: non-qualifying short run]",
-                        "report_evidence_path": fd.get("report_evidence_path"),
-                        "report_evidence_url": fd.get("report_evidence_url"),
-                        "identification_evidence_path": fd.get("identification_evidence_path")
-                        or live_identification_path,
-                        "identification_evidence_url": fd.get("identification_evidence_url")
-                        or live_identification_url,
-                        "actor_type": "student",
-                    }
-                    activities.append(activity)
-                    violations.append({
-                        "activity": activity,
-                        "violation_type": fd.get("behavior_type"),
-                        "severity_level": severity_to_int(severity_str),
-                        "status": "pending",
-                        "timestamp": fd.get("timestamp"),
-                    })
-                    if self.db_session:
-                        await self._log_activity_and_violation(
-                            activity, exam_id, room_id,
-                            create_violation=True,
-                        )
-            for run in qualifying:
-                fd = run.first_detection
-                severity_str, severity_rule = resolve_activity_severity(
-                    run.label_raw, run.frame_count
-                )
-                activity = {
-                    "timestamp": fd.get("timestamp"),
-                    "frame_number": fd.get("frame_number"),
-                    "behavior_type": run.label_raw,
-                    "severity": severity_str,
-                    "run_frame_count": run.frame_count,
-                    "severity_rule": severity_rule,
-                    "confidence": fd.get("confidence"),
-                    "seat_id": fd.get("seat_id"),
-                    "student_id": fd.get("student_id") if not str(student_key).startswith(("bbox:", "seat:", "unidentified")) else None,
-                    "details": fd.get("details", "") or f"({run.frame_count} consecutive frames)",
-                    "report_evidence_path": fd.get("report_evidence_path"),
-                    "report_evidence_url": fd.get("report_evidence_url"),
-                    "identification_evidence_path": live_identification_path
-                    or fd.get("identification_evidence_path"),
-                    "identification_evidence_url": live_identification_url
-                    or fd.get("identification_evidence_url"),
-                    "actor_type": "student",
-                }
-                activities.append(activity)
-                violations.append({
-                    "activity": activity,
-                    "violation_type": run.label_raw,
-                    "severity_level": severity_to_int(severity_str),
-                    "status": "pending",
-                    "timestamp": fd.get("timestamp"),
-                })
-                if self.db_session:
-                    await self._log_activity_and_violation(
-                        activity, exam_id, room_id,
-                        create_violation=True,
-                    )
-
-        violations.sort(
-            key=lambda v: (-int(v.get("severity_level", 0)), str(v.get("timestamp") or ""))
-        )
+        await self._finalize_live_student_runs(exam_id, room_id, state)
 
         return {
             "stream_result": stream_result,
-            "activities_logged": activities,
-            "violations_detected": violations,
-            "total_frames_processed": frame_count,
-            "total_frames_in_video": frame_count
+            "activities_logged": state.activities,
+            "violations_detected": state.violations,
+            "total_frames_processed": state.frame_count,
+            "total_frames_in_video": state.frame_count,
         }
     
     async def _process_recorded_footage(self, stream_id: str, video_path: str,
@@ -1461,32 +1501,38 @@ class VideoProcessor:
             invigilator_phase_count,
         )
 
-        # Run-based logic: one activity + one violation per qualifying run per student (no redundant per-frame)
+        # Run-based logic: one StudentActivity per qualifying run (violations only after investigator review)
         for student_key, det_list in detections_by_student.items():
             runs = get_runs_from_detections(det_list)
             qualifying = filter_qualifying_runs(runs)
             if not qualifying and det_list:
+                merged_runs = get_runs_from_detections(det_list)
                 logger.info(
-                    "No qualifying student runs in recorded mode for key=%s; using fallback detections=%d",
+                    "No qualifying student runs in recorded mode for key=%s; logging %d merged run(s) from %d detections",
                     student_key,
+                    len(merged_runs),
                     len(det_list),
                 )
-                for fd in det_list:
+                for run in merged_runs:
+                    if not run.label_raw or run.normalized_key == "normal":
+                        continue
+                    fd = run.first_detection
                     severity_str, severity_rule = resolve_activity_severity(
-                        str(fd.get("behavior_type") or "unknown"),
-                        1,
+                        run.label_raw,
+                        run.frame_count,
                     )
                     activity = {
                         "timestamp": fd.get("timestamp"),
                         "frame_number": fd.get("frame_number"),
-                        "behavior_type": fd.get("behavior_type"),
+                        "behavior_type": run.label_raw,
                         "severity": severity_str,
-                        "run_frame_count": 1,
-                        "severity_rule": f"{severity_rule}_fallback",
+                        "run_frame_count": run.frame_count,
+                        "severity_rule": f"{severity_rule}_run_merge",
                         "confidence": fd.get("confidence"),
                         "seat_id": fd.get("seat_id"),
                         "student_id": fd.get("student_id") if not str(student_key).startswith(("bbox:", "seat:", "unidentified")) else None,
-                        "details": (fd.get("details", "") or "") + " [fallback: non-qualifying short run]",
+                        "details": (fd.get("details", "") or "").strip()
+                        or f"Sustained {run.frame_count} consecutive sampled frame(s) (same incident).",
                         "evidence_path": fd.get("evidence_path"),
                         "evidence_url": fd.get("evidence_url"),
                         "report_evidence_path": fd.get("report_evidence_path"),
@@ -1498,18 +1544,10 @@ class VideoProcessor:
                         "actor_type": "student",
                     }
                     activities.append(activity)
-                    violations.append({
-                        "activity": activity,
-                        "violation_type": fd.get("behavior_type"),
-                        "severity_level": severity_to_int(severity_str),
-                        "status": "pending",
-                        "evidence_url": fd.get("evidence_url") or fd.get("evidence_path"),
-                        "timestamp": fd.get("timestamp"),
-                    })
                     if self.db_session:
                         await self._log_activity_and_violation(
                             activity, exam_id, room_id,
-                            create_violation=True,
+                            create_violation=False,
                         )
             for run in qualifying:
                 fd = run.first_detection
@@ -1538,23 +1576,11 @@ class VideoProcessor:
                     "actor_type": "student",
                 }
                 activities.append(activity)
-                violations.append({
-                    "activity": activity,
-                    "violation_type": run.label_raw,
-                    "severity_level": severity_to_int(severity_str),
-                    "status": "pending",
-                    "evidence_url": fd.get("evidence_url") or fd.get("evidence_path"),
-                    "timestamp": fd.get("timestamp"),
-                })
                 if self.db_session:
                     await self._log_activity_and_violation(
                         activity, exam_id, room_id,
-                        create_violation=True,
+                        create_violation=False,
                     )
-
-        violations.sort(
-            key=lambda v: (-int(v.get("severity_level", 0)), str(v.get("timestamp") or ""))
-        )
 
         return {
             "success": True,
@@ -1591,8 +1617,8 @@ class VideoProcessor:
         self, activity: Dict, exam_id: str, room_id: str, create_violation: bool = False
     ):
         """
-        Step 6 of UC-07: Store StudentActivity and optionally Violation in database.
-        Uses student_id from seat mapping when available; otherwise uses Unidentified placeholder.
+        Step 6 of UC-07: Store StudentActivity in the database. Optionally create a linked Violation
+        when create_violation is True (pipeline normally leaves this to investigator review).
         """
         if not self.db_session:
             return
